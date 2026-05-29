@@ -4,7 +4,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
-use codex_code_router::config::{AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig};
+use codex_code_router::config::{
+    AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig, DEFAULT_GITHUB_ACCESS_TOKEN_URL,
+    DEFAULT_GITHUB_DEVICE_CODE_URL, DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE,
+};
 use codex_code_router::proxy::{app, AppState};
 use futures_util::stream;
 use std::net::SocketAddr;
@@ -65,6 +68,10 @@ fn test_config(models_url: String, responses_url: String) -> AppConfig {
             token_expiry_buffer: Duration::from_secs(300),
             refresh_enabled: true,
             copilot_token_url: "http://127.0.0.1/copilot-token".to_owned(),
+            github_device_code_url: DEFAULT_GITHUB_DEVICE_CODE_URL.to_owned(),
+            github_access_token_url: DEFAULT_GITHUB_ACCESS_TOKEN_URL.to_owned(),
+            github_oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_owned(),
+            github_oauth_scope: DEFAULT_GITHUB_OAUTH_SCOPE.to_owned(),
         },
         rate_limit: RateLimitConfig {
             max_total_wait: Some(Duration::from_millis(100)),

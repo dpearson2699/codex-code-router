@@ -13,6 +13,7 @@ The current project decision is explicit: **custom Rust adapter, not LiteLLM, no
 - Streams Responses SSE bytes back unchanged.
 - Buffers each incoming request body only so HTTP `429` retries can replay the exact same bytes before anything is sent downstream.
 - Retries upstream HTTP `429 Too Many Requests` using status/headers only.
+- Reads, refreshes, or interactively creates the local GitHub Copilot token file used for upstream auth.
 - Redacts token-bearing headers in diagnostics helpers/tests.
 
 ## What it does not do
@@ -37,9 +38,11 @@ ccrx start
 ccrx status
 ccrx restart
 ccrx stop
+ccrx login
 ```
 
 `ccrx start` runs the adapter in the background, writes a PID file to `~/.codex-code-router/codex-code-router.pid`, and writes logs to `~/.codex-code-router/codex-code-router.log`.
+If no usable Copilot auth exists, `ccrx start` prompts for GitHub's OAuth device login before launching the background service. `ccrx login` runs the same login flow explicitly.
 
 One-time local install from this repo:
 
@@ -56,7 +59,7 @@ cargo run --release -- serve
 
 That command builds the release binary if needed, then starts the local service in the foreground. By default, the service reads `~/.copilot-tokens.json`, so you do **not** need a separate auth-export step if your existing Claude Code Router / Copilot auth flow has created that file.
 
-If the `copilotToken` is expired or near expiry and the token file contains `githubToken`, the Rust service refreshes the Copilot token automatically before forwarding upstream requests. If the file is missing `githubToken`, re-login with a trusted Copilot auth flow to recreate the file.
+If the `copilotToken` is expired or near expiry and the token file contains `githubToken`, the Rust service refreshes the Copilot token automatically before forwarding upstream requests. If the file is missing or the saved GitHub token no longer works, run `ccrx login` or start the service again and complete the device login prompt.
 
 After a release build exists, you can also run the binary directly:
 
@@ -75,7 +78,7 @@ No subcommand also starts the service:
 The preferred local workflow is service-owned upstream auth: Codex points at the local endpoint, and the service obtains the upstream Copilot bearer token from one of these sources:
 
 1. `COPILOT_BEARER_TOKEN`
-2. `COPILOT_TOKEN_FILE`, defaulting to `~/.copilot-tokens.json`, with a `copilotToken` field
+2. `COPILOT_TOKEN_FILE`, defaulting to `~/.copilot-tokens.json`, with a `copilotToken` field; expired values are refreshed from `githubToken`
 3. An incoming `Authorization` header from Codex provider command auth, if neither service-owned source is available
 
 For the usual local setup, source 2 is enough: keep `~/.copilot-tokens.json` available and run `ccrx start`.
@@ -94,7 +97,13 @@ The token-file shape is compatible with the existing CCR-style file:
 
 If `expiresAt` is present and expired or near expiry, the service uses the saved `githubToken` to refresh `copilotToken` through GitHub's Copilot token endpoint, then rewrites the same token file without printing secrets. This matches the practical CCR-style refresh path used by the existing `~/.copilot-tokens.json` file.
 
-The Rust service still does **not** implement interactive GitHub OAuth/device login. If `githubToken` is missing or revoked, re-login with a trusted Copilot auth flow to recreate the token file, or provide a fresh token through `COPILOT_BEARER_TOKEN` / `COPILOT_TOKEN_FILE`.
+If the token file is absent, missing `githubToken`, or the saved GitHub token is revoked, use the built-in GitHub device login:
+
+```sh
+ccrx login
+```
+
+The command prints GitHub's verification URL and one-time user code, polls GitHub until you approve it, exchanges the GitHub token for a Copilot token, and saves `~/.copilot-tokens.json` with `0600` permissions. It never prints the GitHub access token or Copilot bearer token.
 
 ### Token helper subcommand
 
@@ -131,6 +140,8 @@ stream_idle_timeout_ms = 300000
 model_provider = "copilot-proxy"
 model = "gpt-5.5"
 ```
+
+Some Codex app builds currently expect custom providers to declare OpenAI auth before model settings can be edited. If the app refuses to save model settings, set `requires_openai_auth = true` for the local provider and enter a placeholder API-key-shaped value when the app asks. The proxy still uses its service-owned Copilot token first, so the placeholder is not forwarded upstream as long as `ccrx login` / `~/.copilot-tokens.json` has succeeded.
 
 ### Optional command-backed auth profile
 
@@ -188,6 +199,10 @@ Then use Codex separately with the `copilot` profile when you want the Copilot-b
 | `COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS` | `300` | Refuse token-file tokens near expiry. |
 | `COPILOT_TOKEN_REFRESH` | `true` | Refresh expired/near-expiry token-file `copilotToken` values using saved `githubToken`. |
 | `COPILOT_TOKEN_URL` | `https://api.github.com/copilot_internal/v2/token` | GitHub Copilot token refresh endpoint. |
+| `GITHUB_DEVICE_CODE_URL` | `https://github.com/login/device/code` | GitHub OAuth device-code endpoint used by `ccrx login`. |
+| `GITHUB_ACCESS_TOKEN_URL` | `https://github.com/login/oauth/access_token` | GitHub OAuth device-token polling endpoint used by `ccrx login`. |
+| `GITHUB_OAUTH_CLIENT_ID` | `01ab8ac9400c4e429b23` | Copilot-compatible OAuth app client ID used for device login. |
+| `GITHUB_OAUTH_SCOPE` | `read:user` | OAuth scope requested by the Copilot-compatible device login. |
 | `REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout. |
 | `COPILOT_CHAT_VERSION` | `0.35.0` | Copilot Chat header version. |
 | `COPILOT_EDITOR_VERSION` | `vscode/1.109.2` | Editor header version. |
@@ -208,7 +223,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-The test suite covers header injection/redaction, token loading and refresh, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, HTTP `429` retry behavior, auth failure behavior, and unsupported routes.
+The test suite covers header injection/redaction, token loading, refresh, interactive device login, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, HTTP `429` retry behavior, auth failure behavior, and unsupported routes.
 
 ## LiteLLM status
 

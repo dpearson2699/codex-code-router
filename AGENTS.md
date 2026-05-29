@@ -45,6 +45,7 @@ Before changing code, read:
 - The adapter maps local `POST /v1/responses` to Copilot's upstream `/responses` endpoint.
 - The adapter injects Copilot/VS Code-style provider headers.
 - The adapter can own upstream Copilot auth from `COPILOT_BEARER_TOKEN` or `~/.copilot-tokens.json`.
+- The adapter can refresh expired Copilot token-file values from a saved `githubToken` and can create that token file through interactive GitHub OAuth device login.
 - If service-owned auth is unavailable, the adapter can forward an incoming Codex `Authorization` header.
 - The adapter retries upstream HTTP `429` rate limits before sending downstream bytes, following `docs/rate-limit-retry-policy.md`.
 - The adapter passes Responses SSE back unchanged.
@@ -68,6 +69,7 @@ Before changing code, read:
 - Restart local service after install: `ccrx restart`
 - Stop local service after install: `ccrx stop`
 - Check local service after install: `ccrx status`
+- Run interactive GitHub Copilot device login: `ccrx login`
 - Run local service without installing the short command: `cargo run --release -- serve`
 - Print token helper output: `cargo run --quiet -- print-token`
 - Format check: `cargo fmt --check`

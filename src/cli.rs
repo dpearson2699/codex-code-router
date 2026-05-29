@@ -1,7 +1,10 @@
 use crate::config::AppConfig;
 use crate::proxy::serve;
 use crate::service_control::{restart_service, start_service, status_service, stop_service};
-use crate::token::printable_token_from_auth_config;
+use crate::token::{
+    login_with_device_flow, printable_token_from_auth_config,
+    should_try_device_login_after_auth_error,
+};
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use tracing_subscriber::EnvFilter;
@@ -25,6 +28,8 @@ enum Command {
     Restart,
     /// Show whether the local adapter service is reachable.
     Status,
+    /// Run interactive GitHub Copilot device login and save the token file.
+    Login,
     /// Print the configured Copilot bearer token only.
     PrintToken,
 }
@@ -34,12 +39,23 @@ pub async fn run() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             init_tracing();
-            serve(AppConfig::from_env()).await
+            let config = AppConfig::from_env();
+            ensure_auth_ready_or_login(&config).await?;
+            serve(config).await
         }
-        Command::Start => start_service(&AppConfig::from_env()),
+        Command::Start => {
+            let config = AppConfig::from_env();
+            ensure_auth_ready_or_login(&config).await?;
+            start_service(&config)
+        }
         Command::Stop => stop_service(&AppConfig::from_env()),
-        Command::Restart => restart_service(&AppConfig::from_env()),
+        Command::Restart => {
+            let config = AppConfig::from_env();
+            ensure_auth_ready_or_login(&config).await?;
+            restart_service(&config)
+        }
         Command::Status => status_service(&AppConfig::from_env()),
+        Command::Login => login().await,
         Command::PrintToken => print_token().await,
     }
 }
@@ -65,5 +81,32 @@ async fn print_token() -> anyhow::Result<()> {
             eprintln!("{error}");
             std::process::exit(1);
         }
+    }
+}
+
+async fn login() -> anyhow::Result<()> {
+    let config = AppConfig::from_env();
+    let client = reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .build()?;
+    let mut stderr = io::stderr();
+    login_with_device_flow(&config.auth, &config.headers, &client, &mut stderr).await?;
+    Ok(())
+}
+
+async fn ensure_auth_ready_or_login(config: &AppConfig) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .build()?;
+
+    match printable_token_from_auth_config(&config.auth, &config.headers, &client).await {
+        Ok(_) => Ok(()),
+        Err(error) if should_try_device_login_after_auth_error(&error) => {
+            eprintln!("Copilot auth is unavailable: {error}");
+            let mut stderr = io::stderr();
+            login_with_device_flow(&config.auth, &config.headers, &client, &mut stderr).await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }

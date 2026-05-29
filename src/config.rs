@@ -7,6 +7,10 @@ pub const DEFAULT_PORT: u16 = 60001;
 pub const DEFAULT_RESPONSES_URL: &str = "https://api.githubcopilot.com/responses";
 pub const DEFAULT_MODELS_URL: &str = "https://api.githubcopilot.com/models";
 pub const DEFAULT_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+pub const DEFAULT_GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+pub const DEFAULT_GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+pub const DEFAULT_GITHUB_OAUTH_CLIENT_ID: &str = "01ab8ac9400c4e429b23";
+pub const DEFAULT_GITHUB_OAUTH_SCOPE: &str = "read:user";
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -34,6 +38,10 @@ pub struct AuthConfig {
     pub token_expiry_buffer: Duration,
     pub refresh_enabled: bool,
     pub copilot_token_url: String,
+    pub github_device_code_url: String,
+    pub github_access_token_url: String,
+    pub github_oauth_client_id: String,
+    pub github_oauth_scope: String,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +74,19 @@ impl AppConfig {
                 ),
                 refresh_enabled: read_bool("COPILOT_TOKEN_REFRESH", true),
                 copilot_token_url: read_string("COPILOT_TOKEN_URL", DEFAULT_COPILOT_TOKEN_URL),
+                github_device_code_url: read_string(
+                    "GITHUB_DEVICE_CODE_URL",
+                    DEFAULT_GITHUB_DEVICE_CODE_URL,
+                ),
+                github_access_token_url: read_string(
+                    "GITHUB_ACCESS_TOKEN_URL",
+                    DEFAULT_GITHUB_ACCESS_TOKEN_URL,
+                ),
+                github_oauth_client_id: read_string(
+                    "GITHUB_OAUTH_CLIENT_ID",
+                    DEFAULT_GITHUB_OAUTH_CLIENT_ID,
+                ),
+                github_oauth_scope: read_string("GITHUB_OAUTH_SCOPE", DEFAULT_GITHUB_OAUTH_SCOPE),
             },
             rate_limit: RateLimitConfig {
                 max_total_wait: read_max_total_wait(),

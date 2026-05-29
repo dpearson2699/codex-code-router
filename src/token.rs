@@ -4,7 +4,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -36,6 +36,30 @@ pub enum AuthError {
     MissingRefreshFields,
     #[error("incoming Authorization header is not valid UTF-8")]
     InvalidIncomingAuthorization,
+}
+
+#[derive(Debug, Error)]
+pub enum DeviceLoginError {
+    #[error("failed to start GitHub device login: HTTP {status}")]
+    DeviceCodeStatus { status: reqwest::StatusCode },
+    #[error("failed to start GitHub device login: {source}")]
+    DeviceCodeRequest { source: reqwest::Error },
+    #[error("GitHub device-code response is missing device_code, user_code, or verification_uri")]
+    MissingDeviceCodeFields,
+    #[error("failed to poll GitHub device login: HTTP {status}")]
+    AccessTokenStatus { status: reqwest::StatusCode },
+    #[error("failed to poll GitHub device login: {source}")]
+    AccessTokenRequest { source: reqwest::Error },
+    #[error("GitHub device login expired before authorization completed")]
+    Expired,
+    #[error("GitHub device login was denied")]
+    AccessDenied,
+    #[error("GitHub device login failed: {0}")]
+    OAuth(String),
+    #[error("GitHub device login completed but no access_token was returned")]
+    MissingAccessToken,
+    #[error(transparent)]
+    Auth(#[from] AuthError),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -72,6 +96,36 @@ struct RefreshedCopilotToken {
     endpoint: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct DeviceCodeRequest<'a> {
+    client_id: &'a str,
+    scope: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+    device_code: Option<String>,
+    user_code: Option<String>,
+    verification_uri: Option<String>,
+    expires_in: Option<u64>,
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessTokenRequest<'a> {
+    client_id: &'a str,
+    device_code: &'a str,
+    grant_type: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessTokenResponse {
+    access_token: Option<String>,
+    error: Option<String>,
+}
+
+const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
 pub async fn resolve_upstream_authorization(
     auth: &AuthConfig,
     headers: &CopilotHeaderConfig,
@@ -104,6 +158,75 @@ pub async fn printable_token_from_auth_config(
         .ok_or(AuthError::Missing)
 }
 
+pub fn should_try_device_login_after_auth_error(error: &AuthError) -> bool {
+    matches!(
+        error,
+        AuthError::Missing
+            | AuthError::Expired { .. }
+            | AuthError::ExpiredMissingGithubToken { .. }
+            | AuthError::MissingCopilotToken { .. }
+            | AuthError::RefreshStatus { .. }
+            | AuthError::RefreshRequest { .. }
+            | AuthError::MissingRefreshFields
+    )
+}
+
+pub async fn login_with_device_flow(
+    auth: &AuthConfig,
+    headers: &CopilotHeaderConfig,
+    client: &reqwest::Client,
+    out: &mut dyn Write,
+) -> Result<String, DeviceLoginError> {
+    let device = request_device_code(auth, headers, client).await?;
+    let device_code = device
+        .device_code
+        .ok_or(DeviceLoginError::MissingDeviceCodeFields)?;
+    let user_code = device
+        .user_code
+        .ok_or(DeviceLoginError::MissingDeviceCodeFields)?;
+    let verification_uri = device
+        .verification_uri
+        .ok_or(DeviceLoginError::MissingDeviceCodeFields)?;
+    let mut interval = device.interval.unwrap_or(5);
+    let expires_in = device.expires_in.unwrap_or(900);
+
+    writeln!(out, "GitHub Copilot authentication is required.").ok();
+    writeln!(out, "Visit: {verification_uri}").ok();
+    writeln!(out, "Enter code: {user_code}").ok();
+    writeln!(out, "Waiting for authorization...").ok();
+
+    let deadline = now_epoch_seconds().saturating_add(expires_in);
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let response = poll_for_github_token(auth, headers, client, &device_code).await?;
+
+        if let Some(access_token) = response
+            .access_token
+            .map(|value| strip_bearer_prefix(&value))
+            .filter(|value| !value.is_empty())
+        {
+            let refreshed = refresh_copilot_token(auth, headers, client, &access_token).await?;
+            let copilot_token = refreshed.token.clone();
+            write_device_login_token_file(&auth.token_file, access_token, refreshed)?;
+            writeln!(out, "GitHub Copilot authentication saved.").ok();
+            return Ok(copilot_token);
+        }
+
+        match response.error.as_deref() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => interval = interval.saturating_add(5),
+            Some("expired_token") => return Err(DeviceLoginError::Expired),
+            Some("access_denied") => return Err(DeviceLoginError::AccessDenied),
+            Some(error) => return Err(DeviceLoginError::OAuth(error.to_owned())),
+            None => return Err(DeviceLoginError::MissingAccessToken),
+        }
+
+        if now_epoch_seconds() >= deadline {
+            return Err(DeviceLoginError::Expired);
+        }
+    }
+}
+
 async fn configured_token(
     auth: &AuthConfig,
     headers: &CopilotHeaderConfig,
@@ -119,6 +242,76 @@ async fn configured_token(
     }
 
     load_token_file(auth, headers, client).await
+}
+
+async fn request_device_code(
+    auth: &AuthConfig,
+    headers: &CopilotHeaderConfig,
+    client: &reqwest::Client,
+) -> Result<DeviceCodeResponse, DeviceLoginError> {
+    let response = client
+        .post(&auth.github_device_code_url)
+        .header(ACCEPT, HeaderValue::from_static("application/json"))
+        .header(
+            USER_AGENT,
+            header_value(
+                format!("GitHubCopilotChat/{}", headers.copilot_chat_version),
+                "user-agent",
+            )?,
+        )
+        .json(&DeviceCodeRequest {
+            client_id: &auth.github_oauth_client_id,
+            scope: &auth.github_oauth_scope,
+        })
+        .send()
+        .await
+        .map_err(|source| DeviceLoginError::DeviceCodeRequest { source })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DeviceLoginError::DeviceCodeStatus { status });
+    }
+
+    response
+        .json::<DeviceCodeResponse>()
+        .await
+        .map_err(|source| DeviceLoginError::DeviceCodeRequest { source })
+}
+
+async fn poll_for_github_token(
+    auth: &AuthConfig,
+    headers: &CopilotHeaderConfig,
+    client: &reqwest::Client,
+    device_code: &str,
+) -> Result<AccessTokenResponse, DeviceLoginError> {
+    let response = client
+        .post(&auth.github_access_token_url)
+        .header(ACCEPT, HeaderValue::from_static("application/json"))
+        .header(
+            USER_AGENT,
+            header_value(
+                format!("GitHubCopilotChat/{}", headers.copilot_chat_version),
+                "user-agent",
+            )?,
+        )
+        .json(&AccessTokenRequest {
+            client_id: &auth.github_oauth_client_id,
+            device_code,
+            grant_type: DEVICE_CODE_GRANT_TYPE,
+        })
+        .send()
+        .await
+        .map_err(|source| DeviceLoginError::AccessTokenRequest { source })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DeviceLoginError::AccessTokenStatus { status });
+    }
+
+    response
+        .json::<AccessTokenResponse>()
+        .await
+        .map_err(|source| DeviceLoginError::AccessTokenRequest { source })
 }
 
 fn incoming_authorization(inbound: &HeaderMap) -> Result<Option<String>, AuthError> {
@@ -324,6 +517,50 @@ fn write_refreshed_token_file(
     Ok(())
 }
 
+fn write_device_login_token_file(
+    path: &Path,
+    github_token: String,
+    refreshed: RefreshedCopilotToken,
+) -> Result<(), AuthError> {
+    let data = CopilotTokenFile {
+        github_token: Some(github_token),
+        copilot_token: Some(refreshed.token),
+        endpoint: refreshed.endpoint,
+        expires_at: Some(Value::from(refreshed.expires_at)),
+        last_updated: Some(Value::from(now_epoch_seconds())),
+        extra: Map::new(),
+    };
+
+    write_token_file(path, &data)
+}
+
+fn write_token_file(path: &Path, data: &CopilotTokenFile) -> Result<(), AuthError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| AuthError::WriteTokenFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let text = serde_json::to_string_pretty(data).expect("token file should serialize");
+    fs::write(path, format!("{text}\n")).map_err(|source| AuthError::WriteTokenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions).map_err(|source| AuthError::WriteTokenFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+
+    Ok(())
+}
+
 fn header_value(value: String, _label: &'static str) -> Result<HeaderValue, AuthError> {
     HeaderValue::from_str(&value).map_err(|_| AuthError::MissingRefreshFields)
 }
@@ -352,12 +589,16 @@ fn epoch_seconds(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_COPILOT_TOKEN_URL;
-    use axum::routing::get;
+    use crate::config::{
+        DEFAULT_COPILOT_TOKEN_URL, DEFAULT_GITHUB_ACCESS_TOKEN_URL, DEFAULT_GITHUB_DEVICE_CODE_URL,
+        DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE,
+    };
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use http::{HeaderValue, StatusCode};
     use serde_json::json;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::NamedTempFile;
@@ -397,6 +638,10 @@ mod tests {
             token_expiry_buffer: Duration::from_secs(300),
             refresh_enabled: true,
             copilot_token_url: DEFAULT_COPILOT_TOKEN_URL.to_owned(),
+            github_device_code_url: DEFAULT_GITHUB_DEVICE_CODE_URL.to_owned(),
+            github_access_token_url: DEFAULT_GITHUB_ACCESS_TOKEN_URL.to_owned(),
+            github_oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_owned(),
+            github_oauth_scope: DEFAULT_GITHUB_OAUTH_SCOPE.to_owned(),
         }
     }
 
@@ -461,6 +706,10 @@ mod tests {
             token_expiry_buffer: Duration::from_secs(300),
             refresh_enabled: true,
             copilot_token_url: DEFAULT_COPILOT_TOKEN_URL.to_owned(),
+            github_device_code_url: DEFAULT_GITHUB_DEVICE_CODE_URL.to_owned(),
+            github_access_token_url: DEFAULT_GITHUB_ACCESS_TOKEN_URL.to_owned(),
+            github_oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_owned(),
+            github_oauth_scope: DEFAULT_GITHUB_OAUTH_SCOPE.to_owned(),
         };
 
         let headers = HeaderMap::new();
@@ -659,5 +908,139 @@ mod tests {
         assert!(message.contains("HTTP 403"));
         assert!(!message.contains("github-secret-that-must-not-leak"));
         assert!(!message.contains("stale-secret-that-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn device_login_saves_github_and_copilot_tokens_without_printing_secrets() {
+        let file = NamedTempFile::new().unwrap();
+        let _ = fs::remove_file(file.path());
+        let token_polls = Arc::new(AtomicUsize::new(0));
+        let refresh_headers = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let future = now_epoch_seconds() + 3_600;
+        let server = spawn_router({
+            let token_polls = token_polls.clone();
+            let refresh_headers = refresh_headers.clone();
+            Router::new()
+                .route(
+                    "/login/device/code",
+                    post(|| async {
+                        Json(json!({
+                            "device_code": "device-secret-that-must-not-print",
+                            "user_code": "ABCD-EFGH",
+                            "verification_uri": "https://github.com/login/device",
+                            "expires_in": 30,
+                            "interval": 0
+                        }))
+                    }),
+                )
+                .route(
+                    "/login/oauth/access_token",
+                    post(move || {
+                        let token_polls = token_polls.clone();
+                        async move {
+                            if token_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                Json(json!({"error": "authorization_pending"}))
+                            } else {
+                                Json(json!({"access_token": "github-login-token"}))
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/copilot_internal/v2/token",
+                    get(move |headers: HeaderMap| {
+                        let refresh_headers = refresh_headers.clone();
+                        async move {
+                            refresh_headers.lock().unwrap().push(headers);
+                            Json(json!({
+                                "token": "fresh-copilot-token",
+                                "expires_at": future,
+                                "endpoints": {"api": "https://api.githubcopilot.test"}
+                            }))
+                        }
+                    }),
+                )
+        })
+        .await;
+        let mut auth = auth_config(file.path().to_path_buf());
+        auth.github_device_code_url = server.url("/login/device/code");
+        auth.github_access_token_url = server.url("/login/oauth/access_token");
+        auth.copilot_token_url = server.url("/copilot_internal/v2/token");
+        let headers = header_config();
+        let client = reqwest::Client::new();
+        let mut output = Vec::new();
+
+        let token = login_with_device_flow(&auth, &headers, &client, &mut output)
+            .await
+            .unwrap();
+
+        assert_eq!(token, "fresh-copilot-token");
+        assert_eq!(token_polls.load(Ordering::SeqCst), 2);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("https://github.com/login/device"));
+        assert!(output.contains("ABCD-EFGH"));
+        assert!(!output.contains("device-secret-that-must-not-print"));
+        assert!(!output.contains("github-login-token"));
+        assert!(!output.contains("fresh-copilot-token"));
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap();
+        assert_eq!(saved["githubToken"], "github-login-token");
+        assert_eq!(saved["copilotToken"], "fresh-copilot-token");
+        assert_eq!(saved["expiresAt"], future);
+        assert_eq!(
+            saved["endpoint"],
+            "https://api.githubcopilot.test/chat/completions"
+        );
+
+        let refresh_headers = refresh_headers.lock().unwrap();
+        assert_eq!(refresh_headers.len(), 1);
+        assert_eq!(
+            refresh_headers[0].get(AUTHORIZATION).unwrap(),
+            "Bearer github-login-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_login_access_denied_fails_without_writing_token_file() {
+        let file = NamedTempFile::new().unwrap();
+        let _ = fs::remove_file(file.path());
+        let server = spawn_router(
+            Router::new()
+                .route(
+                    "/login/device/code",
+                    post(|| async {
+                        Json(json!({
+                            "device_code": "device-secret-that-must-not-print",
+                            "user_code": "ABCD-EFGH",
+                            "verification_uri": "https://github.com/login/device",
+                            "expires_in": 30,
+                            "interval": 0
+                        }))
+                    }),
+                )
+                .route(
+                    "/login/oauth/access_token",
+                    post(|| async { Json(json!({"error": "access_denied"})) }),
+                ),
+        )
+        .await;
+        let mut auth = auth_config(file.path().to_path_buf());
+        auth.github_device_code_url = server.url("/login/device/code");
+        auth.github_access_token_url = server.url("/login/oauth/access_token");
+        let headers = header_config();
+        let client = reqwest::Client::new();
+        let mut output = Vec::new();
+
+        let error = login_with_device_flow(&auth, &headers, &client, &mut output)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DeviceLoginError::AccessDenied));
+        assert!(
+            !file.path().exists(),
+            "Denied device login should not create a token file."
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("device-secret-that-must-not-print"));
     }
 }
