@@ -26,15 +26,19 @@ The current project decision is explicit: **custom Rust adapter, not LiteLLM, no
 
 Request bodies are forwarded as bytes by default. The adapter does **not** force `store: false`, remove `previous_response_id`, or mutate `include` unless a future concrete Copilot HTTP compatibility failure proves a targeted, isolated, tested mutation is necessary.
 
-## Build and run
+## One-command run
 
-Build the release binary:
+From this repo, this is the normal happy path:
 
 ```sh
-cargo build --release
+cargo run --release -- serve
 ```
 
-Run the service in the foreground:
+That one command builds the release binary if needed, then starts the local service. By default, the service reads `~/.copilot-tokens.json`, so you do **not** need a separate auth-export step if your existing Claude Code Router / Copilot auth flow already keeps a fresh token there.
+
+If the token is missing or expired, refresh/re-login with your existing Copilot auth flow, then rerun the same command.
+
+After a release build exists, you can also run the binary directly:
 
 ```sh
 ./target/release/codex-code-router serve
@@ -46,12 +50,6 @@ No subcommand also starts the service:
 ./target/release/codex-code-router
 ```
 
-For local iteration:
-
-```sh
-cargo run -- serve
-```
-
 ## Auth
 
 The preferred local workflow is service-owned upstream auth: Codex points at the local endpoint, and the service obtains the upstream Copilot bearer token from one of these sources:
@@ -59,6 +57,8 @@ The preferred local workflow is service-owned upstream auth: Codex points at the
 1. `COPILOT_BEARER_TOKEN`
 2. `COPILOT_TOKEN_FILE`, defaulting to `~/.copilot-tokens.json`, with a `copilotToken` field
 3. An incoming `Authorization` header from Codex provider command auth, if neither service-owned source is available
+
+For the usual local setup, source 2 is enough: keep `~/.copilot-tokens.json` fresh and run `cargo run --release -- serve`.
 
 The token-file shape is compatible with the existing CCR-style file:
 
@@ -86,11 +86,11 @@ For this subcommand, stdout contains only the bearer token. Diagnostics go to st
 
 ## Codex config
 
-Add a dedicated Copilot-backed profile. Do not replace your personal/default Codex account profile; keep it separate and switch profiles when you want Copilot-backed execution.
+Add a dedicated Copilot-backed profile in your global Codex config, usually `~/.codex/config.toml`. Do not replace your personal/default Codex account profile; keep it separate and switch profiles when you want Copilot-backed execution.
 
 ### Service-owned auth profile
 
-Use this when the service has `COPILOT_BEARER_TOKEN` or a readable token file:
+Use this when the service has `COPILOT_BEARER_TOKEN` or, more commonly, a readable `~/.copilot-tokens.json` token file:
 
 ```toml
 [model_providers.copilot-proxy]
@@ -142,6 +142,14 @@ model = "gpt-5"
 ```
 
 Then switch with Codex profiles, for example `codex --profile copilot`. The service is not a wrapper that launches Codex.
+
+The recurring workflow is therefore just:
+
+```sh
+cd /Users/dpearson/repos/codex-code-router && cargo run --release -- serve
+```
+
+Then use Codex separately with the `copilot` profile when you want the Copilot-backed provider.
 
 ## Environment
 

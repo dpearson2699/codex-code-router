@@ -64,7 +64,7 @@ Before changing code, read:
 
 ## Commands
 
-- Run in development: `cargo run -- serve`
+- Run local service in one command: `cargo run --release -- serve`
 - Print token helper output: `cargo run --quiet -- print-token`
 - Format check: `cargo fmt --check`
 - Test: `cargo test`
