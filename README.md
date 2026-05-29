@@ -28,13 +28,33 @@ Request bodies are forwarded as bytes by default. The adapter does **not** force
 
 ## One-command run
 
-From this repo, this is the normal happy path:
+The installed short command is `ccrx` so it does not collide with Claude Code Router's `ccr` command.
+
+Daily use:
+
+```sh
+ccrx start
+ccrx status
+ccrx restart
+ccrx stop
+```
+
+`ccrx start` runs the adapter in the background, writes a PID file to `~/.codex-code-router/codex-code-router.pid`, and writes logs to `~/.codex-code-router/codex-code-router.log`.
+
+One-time local install from this repo:
+
+```sh
+cargo build --release --bins
+ln -sf /Users/dpearson/repos/codex-code-router/target/release/ccrx /opt/homebrew/bin/ccrx
+```
+
+If you do not want to install the short command, this also works from the repo:
 
 ```sh
 cargo run --release -- serve
 ```
 
-That one command builds the release binary if needed, then starts the local service. By default, the service reads `~/.copilot-tokens.json`, so you do **not** need a separate auth-export step if your existing Claude Code Router / Copilot auth flow already keeps a fresh token there.
+That command builds the release binary if needed, then starts the local service in the foreground. By default, the service reads `~/.copilot-tokens.json`, so you do **not** need a separate auth-export step if your existing Claude Code Router / Copilot auth flow already keeps a fresh token there.
 
 If the token is missing or expired, refresh/re-login with your existing Copilot auth flow, then rerun the same command.
 
@@ -87,6 +107,8 @@ For this subcommand, stdout contains only the bearer token. Diagnostics go to st
 ## Codex config
 
 Add a dedicated Copilot-backed profile in your global Codex config, usually `~/.codex/config.toml`. Do not replace your personal/default Codex account profile; keep it separate and switch profiles when you want Copilot-backed execution.
+
+This is the global Codex config used by the Codex CLI and by any Codex app/client that honors the same `~/.codex/config.toml` provider/profile settings. If a separate Codex app does not expose profile selection or does not read this config file, it will not automatically use this proxy until that app is pointed at the `copilot` profile or the local provider.
 
 ### Service-owned auth profile
 
@@ -146,7 +168,7 @@ Then switch with Codex profiles, for example `codex --profile copilot`. The serv
 The recurring workflow is therefore just:
 
 ```sh
-cd /Users/dpearson/repos/codex-code-router && cargo run --release -- serve
+ccrx start
 ```
 
 Then use Codex separately with the `copilot` profile when you want the Copilot-backed provider.

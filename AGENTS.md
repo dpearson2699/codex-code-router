@@ -64,7 +64,11 @@ Before changing code, read:
 
 ## Commands
 
-- Run local service in one command: `cargo run --release -- serve`
+- Run local service after install: `ccrx start`
+- Restart local service after install: `ccrx restart`
+- Stop local service after install: `ccrx stop`
+- Check local service after install: `ccrx status`
+- Run local service without installing the short command: `cargo run --release -- serve`
 - Print token helper output: `cargo run --quiet -- print-token`
 - Format check: `cargo fmt --check`
 - Test: `cargo test`
