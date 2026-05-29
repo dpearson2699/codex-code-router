@@ -40,7 +40,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Stop => stop_service(&AppConfig::from_env()),
         Command::Restart => restart_service(&AppConfig::from_env()),
         Command::Status => status_service(&AppConfig::from_env()),
-        Command::PrintToken => print_token(),
+        Command::PrintToken => print_token().await,
     }
 }
 
@@ -51,9 +51,12 @@ fn init_tracing() {
         .init();
 }
 
-fn print_token() -> anyhow::Result<()> {
+async fn print_token() -> anyhow::Result<()> {
     let config = AppConfig::from_env();
-    match printable_token_from_auth_config(&config.auth) {
+    let client = reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .build()?;
+    match printable_token_from_auth_config(&config.auth, &config.headers, &client).await {
         Ok(token) => {
             io::stdout().write_all(token.as_bytes())?;
             Ok(())

@@ -153,7 +153,14 @@ async fn forward(
     default_accept: &'static str,
     default_content_type: bool,
 ) -> Response {
-    let authorization = match resolve_upstream_authorization(&state.config.auth, &inbound_headers) {
+    let authorization = match resolve_upstream_authorization(
+        &state.config.auth,
+        &state.config.headers,
+        &state.client,
+        &inbound_headers,
+    )
+    .await
+    {
         Ok(authorization) => authorization,
         Err(error) => return auth_error_response(error),
     };
@@ -242,10 +249,15 @@ fn auth_error_response(error: AuthError) -> Response {
     let status = match &error {
         AuthError::Missing
         | AuthError::Expired { .. }
+        | AuthError::ExpiredMissingGithubToken { .. }
         | AuthError::InvalidIncomingAuthorization => StatusCode::UNAUTHORIZED,
         AuthError::ReadTokenFile { .. }
         | AuthError::ParseTokenFile { .. }
-        | AuthError::MissingCopilotToken { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        | AuthError::MissingCopilotToken { .. }
+        | AuthError::RefreshStatus { .. }
+        | AuthError::RefreshRequest { .. }
+        | AuthError::WriteTokenFile { .. }
+        | AuthError::MissingRefreshFields => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     json_response(

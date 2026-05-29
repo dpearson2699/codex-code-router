@@ -54,9 +54,9 @@ If you do not want to install the short command, this also works from the repo:
 cargo run --release -- serve
 ```
 
-That command builds the release binary if needed, then starts the local service in the foreground. By default, the service reads `~/.copilot-tokens.json`, so you do **not** need a separate auth-export step if your existing Claude Code Router / Copilot auth flow already keeps a fresh token there.
+That command builds the release binary if needed, then starts the local service in the foreground. By default, the service reads `~/.copilot-tokens.json`, so you do **not** need a separate auth-export step if your existing Claude Code Router / Copilot auth flow has created that file.
 
-If the token is missing or expired, refresh/re-login with your existing Copilot auth flow, then rerun the same command.
+If the `copilotToken` is expired or near expiry and the token file contains `githubToken`, the Rust service refreshes the Copilot token automatically before forwarding upstream requests. If the file is missing `githubToken`, re-login with a trusted Copilot auth flow to recreate the file.
 
 After a release build exists, you can also run the binary directly:
 
@@ -78,7 +78,7 @@ The preferred local workflow is service-owned upstream auth: Codex points at the
 2. `COPILOT_TOKEN_FILE`, defaulting to `~/.copilot-tokens.json`, with a `copilotToken` field
 3. An incoming `Authorization` header from Codex provider command auth, if neither service-owned source is available
 
-For the usual local setup, source 2 is enough: keep `~/.copilot-tokens.json` fresh and run `cargo run --release -- serve`.
+For the usual local setup, source 2 is enough: keep `~/.copilot-tokens.json` available and run `ccrx start`.
 
 The token-file shape is compatible with the existing CCR-style file:
 
@@ -92,7 +92,9 @@ The token-file shape is compatible with the existing CCR-style file:
 }
 ```
 
-If `expiresAt` is present and expired or near expiry, the service refuses to use the token. This Rust implementation currently **does not implement GitHub Copilot OAuth/device refresh**. Refresh with an existing trusted Copilot auth flow, or provide a fresh token through `COPILOT_BEARER_TOKEN` or `COPILOT_TOKEN_FILE`.
+If `expiresAt` is present and expired or near expiry, the service uses the saved `githubToken` to refresh `copilotToken` through GitHub's Copilot token endpoint, then rewrites the same token file without printing secrets. This matches the practical CCR-style refresh path used by the existing `~/.copilot-tokens.json` file.
+
+The Rust service still does **not** implement interactive GitHub OAuth/device login. If `githubToken` is missing or revoked, re-login with a trusted Copilot auth flow to recreate the token file, or provide a fresh token through `COPILOT_BEARER_TOKEN` / `COPILOT_TOKEN_FILE`.
 
 ### Token helper subcommand
 
@@ -184,6 +186,8 @@ Then use Codex separately with the `copilot` profile when you want the Copilot-b
 | `COPILOT_BEARER_TOKEN` | unset | Service-owned upstream Copilot token. |
 | `COPILOT_TOKEN_FILE` | `~/.copilot-tokens.json` | Service-owned token file with `copilotToken`. |
 | `COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS` | `300` | Refuse token-file tokens near expiry. |
+| `COPILOT_TOKEN_REFRESH` | `true` | Refresh expired/near-expiry token-file `copilotToken` values using saved `githubToken`. |
+| `COPILOT_TOKEN_URL` | `https://api.github.com/copilot_internal/v2/token` | GitHub Copilot token refresh endpoint. |
 | `REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout. |
 | `COPILOT_CHAT_VERSION` | `0.35.0` | Copilot Chat header version. |
 | `COPILOT_EDITOR_VERSION` | `vscode/1.109.2` | Editor header version. |
@@ -204,7 +208,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-The test suite covers header injection/redaction, token loading, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, HTTP `429` retry behavior, auth failure behavior, and unsupported routes.
+The test suite covers header injection/redaction, token loading and refresh, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, HTTP `429` retry behavior, auth failure behavior, and unsupported routes.
 
 ## LiteLLM status
 

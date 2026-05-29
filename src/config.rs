@@ -6,6 +6,7 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 60001;
 pub const DEFAULT_RESPONSES_URL: &str = "https://api.githubcopilot.com/responses";
 pub const DEFAULT_MODELS_URL: &str = "https://api.githubcopilot.com/models";
+pub const DEFAULT_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -31,6 +32,8 @@ pub struct AuthConfig {
     pub bearer_token: Option<String>,
     pub token_file: PathBuf,
     pub token_expiry_buffer: Duration,
+    pub refresh_enabled: bool,
+    pub copilot_token_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +64,8 @@ impl AppConfig {
                     "COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS",
                     300,
                 ),
+                refresh_enabled: read_bool("COPILOT_TOKEN_REFRESH", true),
+                copilot_token_url: read_string("COPILOT_TOKEN_URL", DEFAULT_COPILOT_TOKEN_URL),
             },
             rate_limit: RateLimitConfig {
                 max_total_wait: read_max_total_wait(),
@@ -123,6 +128,18 @@ fn read_f64(name: &str, fallback: f64, minimum: f64) -> f64 {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= minimum)
+        .unwrap_or(fallback)
+}
+
+fn read_bool(name: &str, fallback: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .and_then(|value| match value.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
         .unwrap_or(fallback)
 }
 

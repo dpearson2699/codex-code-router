@@ -63,6 +63,8 @@ fn test_config(models_url: String, responses_url: String) -> AppConfig {
             bearer_token: Some("service-owned-token".to_owned()),
             token_file: PathBuf::from("/definitely/not/present"),
             token_expiry_buffer: Duration::from_secs(300),
+            refresh_enabled: true,
+            copilot_token_url: "http://127.0.0.1/copilot-token".to_owned(),
         },
         rate_limit: RateLimitConfig {
             max_total_wait: Some(Duration::from_millis(100)),
