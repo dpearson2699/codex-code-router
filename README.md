@@ -14,7 +14,8 @@ The current project decision is explicit: **custom Rust adapter, not LiteLLM, no
 - Buffers each incoming request body only so HTTP `429` retries can replay the exact same bytes before anything is sent downstream.
 - Retries upstream HTTP `429 Too Many Requests` using status/headers only.
 - Reads, refreshes, or interactively creates the local GitHub Copilot token file used for upstream auth.
-- Redacts token-bearing headers in diagnostics helpers/tests.
+- Writes safe service/request lifecycle logs with local correlation IDs, auth-source summaries, retry decisions, and stream byte/chunk counts.
+- Redacts token-bearing headers, known secret JSON fields, URL query strings, and request IDs in diagnostics helpers/tests.
 
 ## What it does not do
 
@@ -43,6 +44,7 @@ ccrx login
 
 `ccrx start` runs the adapter in the background, writes a PID file to `~/.codex-code-router/codex-code-router.pid`, and writes logs to `~/.codex-code-router/codex-code-router.log`.
 If no usable Copilot auth exists, `ccrx start` prompts for GitHub's OAuth device login before launching the background service. `ccrx login` runs the same login flow explicitly.
+`ccrx status` always prints the normal log path, even when the service is stopped.
 
 One-time local install from this repo:
 
@@ -114,6 +116,72 @@ If you prefer Codex command-backed auth, the Rust binary can print the configure
 ```
 
 For this subcommand, stdout contains only the bearer token. Diagnostics go to stderr.
+
+## Logging and diagnostics
+
+Normal logs are metadata-only and safe by default. They include:
+
+- service-control breadcrumbs from `ccrx start|status|stop|restart`
+- foreground service startup configuration summaries with auth redacted
+- inbound request metadata: local correlation ID, method, target, body byte length, content type, accept header, and forwarded Codex header names
+- upstream attempt/status metadata with redacted URLs and hashed request IDs
+- HTTP `429` retry decisions, including wait source, wait duration, total wait, budget, and budget-exceeded decisions
+- stream terminal diagnostics with chunk count, byte count, and elapsed duration
+
+Normal logs do **not** include request/response bodies, bearer tokens, OAuth tokens, authorization header values, cookies, token-file contents, `encrypted_content`, or full tool-call data.
+
+Background logs are written to:
+
+```text
+~/.codex-code-router/codex-code-router.log
+```
+
+Foreground `serve` writes the same stable non-color format to stderr. When `RUST_LOG` is unset, `serve` uses this safe default filter:
+
+```text
+codex_code_router=info,warn
+```
+
+Set `RUST_LOG` yourself for more detail. For example:
+
+```sh
+RUST_LOG=codex_code_router=debug,warn ccrx restart
+```
+
+### Raw diagnostic JSONL
+
+Raw diagnostics are **off by default** and are intended only for deep debugging. Enable them explicitly:
+
+```sh
+CODEX_CODE_ROUTER_RAW_LOG=1 ccrx restart
+```
+
+By default, raw diagnostic metadata is appended to:
+
+```text
+~/.codex-code-router/raw/diagnostics.jsonl
+```
+
+You can override the path and per-event cap:
+
+```sh
+CODEX_CODE_ROUTER_RAW_LOG=1 \
+CODEX_CODE_ROUTER_RAW_LOG_FILE=/tmp/codex-code-router-raw.jsonl \
+CODEX_CODE_ROUTER_RAW_LOG_MAX_BYTES=65536 \
+ccrx restart
+```
+
+Raw diagnostics currently record bounded/redacted metadata only, not body bytes. Treat the file as sensitive anyway: metadata can still reveal request timing, model choices, tool names, or other workflow context.
+
+Body capture is intentionally not enabled by normal `debug` logging. If it is ever added, it must be separately opt-in, size-limited, redacted, and stored outside the normal service log.
+
+### Diagnosing a hanging Codex request
+
+1. Run `ccrx status` and note the printed log path.
+2. Inspect the latest entries for the local correlation ID attached to the stuck request.
+3. If you see `upstream rate-limited request`, check `wait_source`, `wait_ms`, `total_wait_after_ms`, and `budget_ms`; default `RATE_LIMIT_MAX_TOTAL_WAIT_MS=0` means the adapter can wait indefinitely for Copilot's rate-limit window.
+4. If you see `upstream response ready; streaming to client` but no stream terminal event yet, the upstream stream is still active or the downstream client has not fully consumed/dropped it.
+5. If the normal log is not enough, enable raw diagnostics temporarily, reproduce the issue, collect the JSONL, then disable raw diagnostics again.
 
 ## Codex config
 
@@ -211,6 +279,10 @@ Then use Codex separately with the `copilot` profile when you want the Copilot-b
 | `RATE_LIMIT_MAX_SLEEP_MS` | `60000` | Maximum sleep for one rate-limit retry. |
 | `RATE_LIMIT_INITIAL_BACKOFF_MS` | `1000` | Fallback initial delay when no usable rate-limit headers are present. |
 | `RATE_LIMIT_BACKOFF_MULTIPLIER` | `2` | Fallback exponential multiplier. |
+| `RUST_LOG` | unset | Optional tracing filter; when unset, `serve` uses `codex_code_router=info,warn`. |
+| `CODEX_CODE_ROUTER_RAW_LOG` | unset / false | Set to `1`, `true`, `yes`, or `on` to enable opt-in raw diagnostic JSONL metadata. |
+| `CODEX_CODE_ROUTER_RAW_LOG_FILE` | `~/.codex-code-router/raw/diagnostics.jsonl` | Raw diagnostic JSONL file path. |
+| `CODEX_CODE_ROUTER_RAW_LOG_MAX_BYTES` | `65536` | Maximum bytes for one raw diagnostic event before it is replaced with a truncation marker. |
 
 See `.env.example` for a copyable local template.
 
@@ -223,7 +295,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-The test suite covers header injection/redaction, token loading, refresh, interactive device login, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, HTTP `429` retry behavior, auth failure behavior, and unsupported routes.
+The test suite covers header/URL/JSON redaction, safe config/auth summaries, token loading, refresh, interactive device login, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, request lifecycle diagnostics, HTTP `429` retry diagnostics, auth/send failure diagnostics, stream byte/chunk counts, auth failure behavior, unsupported routes, and the strict `print-token` stdout contract.
 
 ## LiteLLM status
 

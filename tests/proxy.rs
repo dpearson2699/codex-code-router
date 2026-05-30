@@ -5,16 +5,20 @@ use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use codex_code_router::config::{
-    AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig, DEFAULT_GITHUB_ACCESS_TOKEN_URL,
-    DEFAULT_GITHUB_DEVICE_CODE_URL, DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE,
+    AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig, RawLogConfig,
+    DEFAULT_GITHUB_ACCESS_TOKEN_URL, DEFAULT_GITHUB_DEVICE_CODE_URL,
+    DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE,
 };
 use codex_code_router::proxy::{app, AppState};
 use futures_util::stream;
+use serde_json::Value;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 
 #[derive(Clone, Debug)]
@@ -79,11 +83,50 @@ fn test_config(models_url: String, responses_url: String) -> AppConfig {
             initial_backoff: Duration::from_millis(1),
             backoff_multiplier: 2.0,
         },
+        raw_log: RawLogConfig {
+            enabled: false,
+            file: PathBuf::from("/tmp/codex-code-router-test-raw.jsonl"),
+            max_bytes: 4096,
+        },
     }
 }
 
 async fn spawn_app(config: AppConfig) -> TestServer {
     spawn_router(app(AppState::new(config).unwrap())).await
+}
+
+fn enable_raw_log(config: &mut AppConfig, file: &NamedTempFile) {
+    config.raw_log.enabled = true;
+    config.raw_log.file = file.path().to_path_buf();
+    config.raw_log.max_bytes = 16 * 1024;
+}
+
+fn raw_log_text(file: &NamedTempFile) -> String {
+    fs::read_to_string(file.path()).unwrap_or_default()
+}
+
+fn raw_event_fields(text: &str, kind: &str) -> Vec<Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event.get("kind").and_then(Value::as_str) == Some(kind))
+        .filter_map(|event| event.get("fields").cloned())
+        .collect()
+}
+
+fn assert_no_log_secret(text: &str, secret: &str) {
+    assert!(
+        !text.contains(secret),
+        "diagnostic log leaked secret `{secret}`: {text}"
+    );
+}
+
+fn assert_has_terminal_stream_event(text: &str) {
+    assert!(
+        text.contains("upstream_stream_completed") || text.contains("upstream_stream_dropped"),
+        "expected a terminal stream diagnostic event with counts: {text}"
+    );
+    assert!(text.contains("chunk_count"));
+    assert!(text.contains("byte_count"));
 }
 
 #[tokio::test]
@@ -156,6 +199,41 @@ async fn models_proxy_forwards_to_mocked_upstream_with_copilot_headers() {
 }
 
 #[tokio::test]
+async fn models_raw_diagnostics_log_lifecycle_without_tokens() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let mock = spawn_router(Router::new().route(
+        "/models",
+        get(|| async {
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                r#"{"data":[{"id":"gpt-test"}]}"#,
+            )
+        }),
+    ))
+    .await;
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    enable_raw_log(&mut config, &raw_log);
+    let server = spawn_app(config).await;
+
+    let response = reqwest::get(server.url("/v1/models")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.unwrap();
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("inbound_request"));
+    assert!(text.contains("upstream_response_ready"));
+    assert_has_terminal_stream_event(&text);
+    assert!(text.contains("local_id"));
+    assert!(text.contains("Models"));
+    assert_no_log_secret(&text, "service-owned-token");
+
+    let inbound = raw_event_fields(&text, "inbound_request");
+    assert_eq!(inbound[0]["target"], "Models");
+    assert_eq!(inbound[0]["body_len"], 0);
+}
+
+#[tokio::test]
 async fn responses_proxy_streams_sse_bytes_unchanged() {
     let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
     let upstream_sse = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
@@ -222,6 +300,75 @@ event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, request_body);
     assert_eq!(requests[0].headers.get("accept").unwrap(), "*/*");
+}
+
+#[tokio::test]
+async fn responses_raw_diagnostics_log_lifecycle_and_stream_counts_without_body_or_token() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let upstream_sse = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+    let mock = spawn_router({
+        let upstream_sse = upstream_sse.to_owned();
+        Router::new().route(
+            "/responses",
+            post(move || {
+                let upstream_sse = upstream_sse.clone();
+                async move {
+                    let chunks = stream::iter([
+                        Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                            upstream_sse[..48].to_owned(),
+                        )),
+                        Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                            upstream_sse[48..].to_owned(),
+                        )),
+                    ]);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(chunks))
+                        .unwrap()
+                }
+            }),
+        )
+    })
+    .await;
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    enable_raw_log(&mut config, &raw_log);
+    let server = spawn_app(config).await;
+    let request_body = br#"{"model":"gpt-test","input":"body-secret-that-must-not-log"}"#;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .header("content-type", "application/json")
+        .header("x-codex-window-id", "window-1")
+        .body(request_body.as_slice().to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), upstream_sse.as_bytes());
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("inbound_request"));
+    assert!(text.contains("upstream_response_ready"));
+    assert!(text.contains("upstream_stream_completed"));
+    assert!(text.contains("local_id"));
+    assert!(text.contains("Responses"));
+    assert_no_log_secret(&text, "service-owned-token");
+    assert_no_log_secret(&text, "body-secret-that-must-not-log");
+
+    let inbound = raw_event_fields(&text, "inbound_request");
+    assert_eq!(inbound[0]["target"], "Responses");
+    assert_eq!(inbound[0]["body_len"], request_body.len());
+    assert_eq!(
+        inbound[0]["forwarded_codex_headers"][0],
+        "x-codex-window-id"
+    );
+
+    let stream_events = raw_event_fields(&text, "upstream_stream_completed");
+    assert_eq!(stream_events[0]["byte_count"], upstream_sse.len());
+    assert!(stream_events[0]["chunk_count"].as_u64().unwrap() >= 1);
 }
 
 #[tokio::test]
@@ -392,6 +539,41 @@ async fn responses_retry_uses_retry_after_and_preserves_body() {
 }
 
 #[tokio::test]
+async fn retry_raw_diagnostics_include_wait_source_budget_and_correlation_without_body() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mock = retry_mock(recorded, attempts.clone(), RetryMode::RetryAfterThenOk).await;
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    config.rate_limit.max_sleep = Duration::from_millis(1);
+    enable_raw_log(&mut config, &raw_log);
+    let server = spawn_app(config).await;
+    let request_body = br#"{"model":"gpt-test","input":"retry-body-secret"}"#;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body(request_body.as_slice().to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "ok after retry");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("upstream_rate_limited"));
+    assert!(text.contains("RetryAfter"));
+    assert!(text.contains("local_id"));
+    assert_no_log_secret(&text, "service-owned-token");
+    assert_no_log_secret(&text, "retry-body-secret");
+    let retry = raw_event_fields(&text, "upstream_rate_limited");
+    assert_eq!(retry[0]["status"], StatusCode::TOO_MANY_REQUESTS.as_u16());
+    assert_eq!(retry[0]["retry_budget_exceeded"], false);
+    assert!(retry[0].get("budget_ms").is_some());
+    assert!(retry[0].get("upstream_request_id").is_some());
+}
+
+#[tokio::test]
 async fn responses_retry_uses_fallback_backoff_without_headers() {
     let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -464,6 +646,67 @@ async fn responses_retry_returns_429_after_positive_wait_budget_is_exceeded() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body, "still limited");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn budget_exhaustion_raw_diagnostics_record_decision_without_secrets() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mock = retry_mock(recorded, attempts.clone(), RetryMode::AlwaysRateLimited).await;
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    config.rate_limit.max_total_wait = Some(Duration::ZERO);
+    enable_raw_log(&mut config, &raw_log);
+    let server = spawn_app(config).await;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body("budget-body-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.text().await.unwrap(), "still limited");
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("upstream_rate_limited"));
+    assert_has_terminal_stream_event(&text);
+    assert_no_log_secret(&text, "service-owned-token");
+    assert_no_log_secret(&text, "budget-body-secret");
+    let retry = raw_event_fields(&text, "upstream_rate_limited");
+    assert_eq!(retry[0]["retry_budget_exceeded"], true);
+}
+
+#[tokio::test]
+async fn send_failure_raw_diagnostics_are_correlated_and_redact_url_queries() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let mut config = test_config(
+        format!("http://{addr}/models?token=query-secret"),
+        format!("http://{addr}/responses?token=query-secret"),
+    );
+    enable_raw_log(&mut config, &raw_log);
+    let server = spawn_app(config).await;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body("send-failure-body-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let response_body = response.text().await.unwrap();
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("upstream_request_failed"));
+    assert!(text.contains("local_id"));
+    assert_no_log_secret(&text, "service-owned-token");
+    assert_no_log_secret(&text, "query-secret");
+    assert_no_log_secret(&text, "send-failure-body-secret");
+    assert_no_log_secret(&response_body, "query-secret");
+    assert_no_log_secret(&response_body, "send-failure-body-secret");
 }
 
 #[tokio::test]
