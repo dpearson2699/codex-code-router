@@ -18,6 +18,8 @@ pub enum AuthError {
     Expired { path: PathBuf },
     #[error("Copilot token file is expired or near expiry and cannot be refreshed because it is missing githubToken: {path}")]
     ExpiredMissingGithubToken { path: PathBuf },
+    #[error("Copilot token file cannot be refreshed because token refresh is disabled or githubToken is missing: {path}")]
+    TokenFileNotRefreshable { path: PathBuf },
     #[error("failed to read Copilot token file {path}: {source}")]
     ReadTokenFile { path: PathBuf, source: io::Error },
     #[error("failed to parse Copilot token file {path}: {source}")]
@@ -29,7 +31,7 @@ pub enum AuthError {
     MissingCopilotToken { path: PathBuf },
     #[error("failed to refresh Copilot token: HTTP {status}")]
     RefreshStatus { status: reqwest::StatusCode },
-    #[error("failed to refresh Copilot token: {source}")]
+    #[error("failed to refresh Copilot token request")]
     RefreshRequest { source: reqwest::Error },
     #[error("failed to write refreshed Copilot token file {path}: {source}")]
     WriteTokenFile { path: PathBuf, source: io::Error },
@@ -104,6 +106,7 @@ pub enum AuthSource {
         path: PathBuf,
         expires_at: Option<u64>,
         refreshed: bool,
+        refreshable: bool,
     },
     IncomingAuthorization,
 }
@@ -209,12 +212,25 @@ pub async fn printable_token_from_auth_config(
         .ok_or(AuthError::Missing)
 }
 
+pub async fn refresh_token_file_authorization(
+    auth: &AuthConfig,
+    headers: &CopilotHeaderConfig,
+    client: &reqwest::Client,
+) -> Result<ResolvedAuthorization, AuthError> {
+    let configured = refresh_token_file(auth, headers, client).await?;
+    Ok(ResolvedAuthorization {
+        header_value: as_authorization_header(&configured.token),
+        source: configured.source,
+    })
+}
+
 pub fn should_try_device_login_after_auth_error(error: &AuthError) -> bool {
     matches!(
         error,
         AuthError::Missing
             | AuthError::Expired { .. }
             | AuthError::ExpiredMissingGithubToken { .. }
+            | AuthError::TokenFileNotRefreshable { .. }
             | AuthError::MissingCopilotToken { .. }
             | AuthError::RefreshStatus { .. }
             | AuthError::RefreshRequest { .. }
@@ -421,14 +437,16 @@ async fn load_token_file(
             source,
         })?;
 
+    let refreshable = auth.refresh_enabled && has_refreshable_github_token(&data);
     let expires_at = data.expires_at.as_ref().and_then(epoch_seconds);
     if !is_expired_or_near_expiry(data.expires_at.as_ref(), auth.token_expiry_buffer) {
-        let configured = copilot_token_from_data(path, data, expires_at, false)?;
+        let configured = copilot_token_from_data(path, data, expires_at, false, refreshable)?;
         info!(
             auth_source = "token_file",
             path = %path.display(),
             expires_at,
             refreshed = false,
+            refreshable,
             "using Copilot token from token file"
         );
         return Ok(Some(configured));
@@ -468,8 +486,57 @@ async fn load_token_file(
             path: path.to_path_buf(),
             expires_at,
             refreshed: true,
+            refreshable: true,
         },
     }))
+}
+
+async fn refresh_token_file(
+    auth: &AuthConfig,
+    headers: &CopilotHeaderConfig,
+    client: &reqwest::Client,
+) -> Result<ConfiguredToken, AuthError> {
+    let path = &auth.token_file;
+    if !auth.refresh_enabled {
+        return Err(AuthError::TokenFileNotRefreshable {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let text = fs::read_to_string(path).map_err(|source| AuthError::ReadTokenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let data: CopilotTokenFile =
+        serde_json::from_str(&text).map_err(|source| AuthError::ParseTokenFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let github_token = github_token_from_data(path, &data)?;
+
+    let refreshed = refresh_copilot_token(auth, headers, client, &github_token).await?;
+    let token = refreshed.token.clone();
+    let expires_at = Some(refreshed.expires_at);
+    write_refreshed_token_file(path, data, refreshed)?;
+
+    info!(
+        auth_source = "token_file",
+        path = %path.display(),
+        expires_at,
+        refreshed = true,
+        refreshable = true,
+        "force-refreshed Copilot token from token file"
+    );
+
+    Ok(ConfiguredToken {
+        token,
+        source: AuthSource::TokenFile {
+            path: path.to_path_buf(),
+            expires_at,
+            refreshed: true,
+            refreshable: true,
+        },
+    })
 }
 
 fn copilot_token_from_data(
@@ -477,6 +544,7 @@ fn copilot_token_from_data(
     data: CopilotTokenFile,
     expires_at: Option<u64>,
     refreshed: bool,
+    refreshable: bool,
 ) -> Result<ConfiguredToken, AuthError> {
     let token = data
         .copilot_token
@@ -492,8 +560,26 @@ fn copilot_token_from_data(
             path: path.to_path_buf(),
             expires_at,
             refreshed,
+            refreshable,
         },
     })
+}
+
+fn has_refreshable_github_token(data: &CopilotTokenFile) -> bool {
+    data.github_token
+        .as_deref()
+        .map(strip_bearer_prefix)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn github_token_from_data(path: &Path, data: &CopilotTokenFile) -> Result<String, AuthError> {
+    data.github_token
+        .as_deref()
+        .map(strip_bearer_prefix)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AuthError::TokenFileNotRefreshable {
+            path: path.to_path_buf(),
+        })
 }
 
 fn is_expired_or_near_expiry(expires_at: Option<&Value>, expiry_buffer: Duration) -> bool {
@@ -987,6 +1073,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_refresh_token_file_replaces_locally_valid_copilot_token() {
+        let file = NamedTempFile::new().unwrap();
+        let original_future = now_epoch_seconds() + 600;
+        fs::write(
+            file.path(),
+            format!(
+                r#"{{"githubToken":"github-secret","copilotToken":"locally-valid-but-rejected","expiresAt":{original_future},"extraField":"preserved"}}"#
+            ),
+        )
+        .unwrap();
+        let recorded = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let refreshed_future = now_epoch_seconds() + 3_600;
+        let server = spawn_router({
+            let recorded = recorded.clone();
+            Router::new().route(
+                "/copilot_internal/v2/token",
+                get(move |headers: HeaderMap| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().unwrap().push(headers);
+                        Json(json!({
+                            "token": "fresh-copilot-token",
+                            "expires_at": refreshed_future,
+                            "endpoints": {"api": "https://api.githubcopilot.test"}
+                        }))
+                    }
+                }),
+            )
+        })
+        .await;
+        let mut auth = auth_config(file.path().to_path_buf());
+        auth.copilot_token_url = server.url("/copilot_internal/v2/token");
+        let headers = header_config();
+        let client = reqwest::Client::new();
+
+        let authorization = refresh_token_file_authorization(&auth, &headers, &client)
+            .await
+            .unwrap();
+
+        assert_eq!(authorization.header_value(), "Bearer fresh-copilot-token");
+        assert_eq!(
+            authorization.source(),
+            &AuthSource::TokenFile {
+                path: file.path().to_path_buf(),
+                expires_at: Some(refreshed_future),
+                refreshed: true,
+                refreshable: true,
+            }
+        );
+        assert!(!format!("{authorization:?}").contains("fresh-copilot-token"));
+        let saved_text = fs::read_to_string(file.path()).unwrap();
+        let saved: Value = serde_json::from_str(&saved_text).unwrap();
+        assert_eq!(saved["copilotToken"], "fresh-copilot-token");
+        assert_eq!(saved["githubToken"], "github-secret");
+        assert_eq!(saved["expiresAt"], refreshed_future);
+        assert_eq!(saved["extraField"], "preserved");
+        assert!(saved["lastUpdated"].as_u64().unwrap() > 0);
+        assert_eq!(
+            saved["endpoint"],
+            "https://api.githubcopilot.test/chat/completions"
+        );
+        assert!(!saved_text.contains("locally-valid-but-rejected"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(file.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].get(AUTHORIZATION).unwrap(),
+            "Bearer github-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_refresh_token_file_missing_github_token_fails_without_secret_leakage() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{"copilotToken":"copilot-secret-that-must-not-leak","expiresAt":9999999999}"#,
+        )
+        .unwrap();
+        let auth = auth_config(file.path().to_path_buf());
+        let headers = header_config();
+        let client = reqwest::Client::new();
+
+        let error = refresh_token_file_authorization(&auth, &headers, &client)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(matches!(error, AuthError::TokenFileNotRefreshable { .. }));
+        assert!(message.contains("cannot be refreshed"));
+        assert!(!message.contains("copilot-secret-that-must-not-leak"));
+    }
+
+    #[tokio::test]
     async fn refresh_http_errors_do_not_echo_saved_tokens() {
         let file = NamedTempFile::new().unwrap();
         fs::write(
@@ -1008,6 +1197,34 @@ mod tests {
         assert!(message.contains("HTTP 403"));
         assert!(!message.contains("github-secret-that-must-not-leak"));
         assert!(!message.contains("stale-secret-that-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn refresh_request_errors_do_not_echo_url_queries_or_saved_tokens() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{"githubToken":"github-secret-that-must-not-leak","copilotToken":"copilot-secret-that-must-not-leak","expiresAt":9999999999}"#,
+        )
+        .unwrap();
+        let mut auth = auth_config(file.path().to_path_buf());
+        auth.copilot_token_url =
+            "http://127.0.0.1:1/copilot_internal/v2/token?token=refresh-url-secret".to_owned();
+        let headers = header_config();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let error = refresh_token_file_authorization(&auth, &headers, &client)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("failed to refresh Copilot token request"));
+        assert!(!message.contains("refresh-url-secret"));
+        assert!(!message.contains("github-secret-that-must-not-leak"));
+        assert!(!message.contains("copilot-secret-that-must-not-leak"));
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ The current project decision is explicit: **custom Rust adapter, not LiteLLM, no
 - Buffers each incoming request body only so HTTP `429` retries can replay the exact same bytes before anything is sent downstream.
 - Retries upstream HTTP `429 Too Many Requests` using status/headers only.
 - Reads, refreshes, or interactively creates the local GitHub Copilot token file used for upstream auth.
+- Refreshes token-file auth on local expiry checks and, for refreshable token-file auth only, once after an upstream HTTP `401 Unauthorized` before replaying the same request bytes.
 - Writes safe service/request lifecycle logs with local correlation IDs, auth-source summaries, retry decisions, and stream byte/chunk counts.
 - Redacts token-bearing headers, known secret JSON fields, URL query strings, and request IDs in diagnostics helpers/tests.
 
@@ -99,6 +100,8 @@ The token-file shape is compatible with the existing CCR-style file:
 
 If `expiresAt` is present and expired or near expiry, the service uses the saved `githubToken` to refresh `copilotToken` through GitHub's Copilot token endpoint, then rewrites the same token file without printing secrets. This matches the practical CCR-style refresh path used by the existing `~/.copilot-tokens.json` file.
 
+If Copilot later returns upstream HTTP `401 Unauthorized` for an otherwise locally-valid token-file `copilotToken`, the service force-refreshes that token file once from the saved `githubToken`, rebuilds upstream authorization headers, and replays the original request body bytes. This reactive path is deliberately narrow: it uses HTTP status only, does not inspect the 401 response body, and does not run for `COPILOT_BEARER_TOKEN` or incoming Codex `Authorization` sources.
+
 If the token file is absent, missing `githubToken`, or the saved GitHub token is revoked, use the built-in GitHub device login:
 
 ```sh
@@ -125,6 +128,7 @@ Normal logs are metadata-only and safe by default. They include:
 - foreground service startup configuration summaries with auth redacted
 - inbound request metadata: local correlation ID, method, target, body byte length, content type, accept header, and forwarded Codex header names
 - upstream attempt/status metadata with redacted URLs and hashed request IDs
+- one-shot reactive HTTP `401` token-file refresh/retry metadata when Copilot rejects a refreshable saved token
 - HTTP `429` retry decisions, including wait source, wait duration, total wait, budget, and budget-exceeded decisions
 - stream terminal diagnostics with chunk count, byte count, and elapsed duration
 
@@ -294,7 +298,7 @@ Then use Codex separately with the `copilot` profile when you want the Copilot-b
 | `COPILOT_BEARER_TOKEN` | unset | Service-owned upstream Copilot token. |
 | `COPILOT_TOKEN_FILE` | `~/.copilot-tokens.json` | Service-owned token file with `copilotToken`. |
 | `COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS` | `300` | Refuse token-file tokens near expiry. |
-| `COPILOT_TOKEN_REFRESH` | `true` | Refresh expired/near-expiry token-file `copilotToken` values using saved `githubToken`. |
+| `COPILOT_TOKEN_REFRESH` | `true` | Refresh expired/near-expiry token-file `copilotToken` values and enable one reactive HTTP `401` refresh/replay using saved `githubToken`. |
 | `COPILOT_TOKEN_URL` | `https://api.github.com/copilot_internal/v2/token` | GitHub Copilot token refresh endpoint. |
 | `GITHUB_DEVICE_CODE_URL` | `https://github.com/login/device/code` | GitHub OAuth device-code endpoint used by `ccrx login`. |
 | `GITHUB_ACCESS_TOKEN_URL` | `https://github.com/login/oauth/access_token` | GitHub OAuth device-token polling endpoint used by `ccrx login`. |
@@ -325,7 +329,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-The test suite covers header/URL/JSON redaction, safe config/auth summaries, token loading, refresh, interactive device login, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, request lifecycle diagnostics, HTTP `429` retry diagnostics, auth/send failure diagnostics, stream byte/chunk counts, auth failure behavior, unsupported routes, and the strict `print-token` stdout contract.
+The test suite covers header/URL/JSON redaction, safe config/auth summaries, token loading, expiry-based refresh, reactive HTTP `401` token-file refresh/replay, interactive device login, `/health`, `/v1/models` proxying, `/v1/responses` SSE passthrough, request lifecycle diagnostics, HTTP `429` retry diagnostics, auth/send failure diagnostics, stream byte/chunk counts, auth failure behavior, unsupported routes, and the strict `print-token` stdout contract.
 
 ## LiteLLM status
 

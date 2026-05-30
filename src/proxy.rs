@@ -5,7 +5,9 @@ use crate::diagnostics::{
 use crate::headers::{build_upstream_headers, forwarded_codex_header_names};
 use crate::redaction::{hash_and_truncate, redact_headers, redact_url, truncate_for_log};
 use crate::retry::{retry_budget_exceeded, select_retry_wait};
-use crate::token::{resolve_upstream_authorization, AuthError};
+use crate::token::{
+    refresh_token_file_authorization, resolve_upstream_authorization, AuthError, AuthSource,
+};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
@@ -221,7 +223,7 @@ async fn forward(
         );
     }
 
-    let authorization = match resolve_upstream_authorization(
+    let mut authorization = match resolve_upstream_authorization(
         &state.config.auth,
         &state.config.headers,
         &state.client,
@@ -255,6 +257,7 @@ async fn forward(
     let redacted_url = redact_url(&url);
     let mut attempt = 0_u32;
     let mut total_wait = Duration::ZERO;
+    let mut auth_refresh_attempted = false;
 
     loop {
         let request_id = Uuid::new_v4().to_string();
@@ -366,6 +369,72 @@ async fn forward(
                 );
             }
         };
+
+        if upstream.status() == StatusCode::UNAUTHORIZED
+            && !auth_refresh_attempted
+            && auth_source_is_refreshable_token_file(authorization.source())
+        {
+            let elapsed = attempt_started.elapsed();
+            let refresh_source = authorization.source().clone();
+            warn!(
+                local_id,
+                target = target.as_str(),
+                attempt = attempt_number,
+                status = %StatusCode::UNAUTHORIZED,
+                auth_source = ?refresh_source,
+                elapsed_ms = elapsed.as_millis(),
+                upstream_request_id = %request_id_summary,
+                "upstream rejected token-file authorization; force-refreshing token and retrying once"
+            );
+            write_raw_event(
+                &state.config.raw_log,
+                "upstream_auth_refresh_retry",
+                json!({
+                    "local_id": &local_id,
+                    "target": target.as_str(),
+                    "attempt": attempt_number,
+                    "status": StatusCode::UNAUTHORIZED.as_u16(),
+                    "auth_source": format!("{:?}", refresh_source),
+                    "elapsed_ms": elapsed.as_millis(),
+                    "upstream_request_id": request_id_summary,
+                }),
+            );
+
+            let _ = upstream.bytes().await;
+            auth_refresh_attempted = true;
+            match refresh_token_file_authorization(
+                &state.config.auth,
+                &state.config.headers,
+                &state.client,
+            )
+            .await
+            {
+                Ok(refreshed_authorization) => {
+                    info!(
+                        local_id,
+                        target = target.as_str(),
+                        auth_source = ?refreshed_authorization.source(),
+                        "resolved refreshed token-file authorization for upstream retry"
+                    );
+                    write_raw_event(
+                        &state.config.raw_log,
+                        "auth_refreshed",
+                        json!({
+                            "local_id": &local_id,
+                            "target": target.as_str(),
+                            "auth_source": format!("{:?}", refreshed_authorization.source()),
+                        }),
+                    );
+                    authorization = refreshed_authorization;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    log_auth_error(&local_id, target, &state, &error);
+                    return auth_error_response(error);
+                }
+            }
+        }
 
         if upstream.status() != StatusCode::TOO_MANY_REQUESTS {
             let status = upstream.status();
@@ -492,6 +561,16 @@ async fn forward(
     }
 }
 
+fn auth_source_is_refreshable_token_file(source: &AuthSource) -> bool {
+    matches!(
+        source,
+        AuthSource::TokenFile {
+            refreshable: true,
+            ..
+        }
+    )
+}
+
 fn log_auth_error(local_id: &str, target: Target, state: &AppState, error: &AuthError) {
     let status = auth_error_status(error);
     let level = if status == StatusCode::UNAUTHORIZED {
@@ -551,6 +630,7 @@ fn auth_error_status(error: &AuthError) -> StatusCode {
         AuthError::Missing
         | AuthError::Expired { .. }
         | AuthError::ExpiredMissingGithubToken { .. }
+        | AuthError::TokenFileNotRefreshable { .. }
         | AuthError::InvalidIncomingAuthorization => StatusCode::UNAUTHORIZED,
         AuthError::ReadTokenFile { .. }
         | AuthError::ParseTokenFile { .. }
@@ -833,6 +913,7 @@ fn auth_error_class(error: &AuthError) -> &'static str {
         AuthError::Missing => "missing",
         AuthError::Expired { .. } => "expired",
         AuthError::ExpiredMissingGithubToken { .. } => "expired_missing_github_token",
+        AuthError::TokenFileNotRefreshable { .. } => "token_file_not_refreshable",
         AuthError::ReadTokenFile { .. } => "read_token_file",
         AuthError::ParseTokenFile { .. } => "parse_token_file",
         AuthError::MissingCopilotToken { .. } => "missing_copilot_token",

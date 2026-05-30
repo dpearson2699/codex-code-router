@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 
@@ -133,6 +133,14 @@ fn assert_has_terminal_stream_event(text: &str) {
     );
     assert!(text.contains("chunk_count"));
     assert!(text.contains("byte_count"));
+}
+
+fn future_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600
 }
 
 #[tokio::test]
@@ -656,6 +664,294 @@ async fn responses_retry_uses_retry_after_and_preserves_body() {
     assert_ne!(
         requests[0].headers.get("x-request-id"),
         requests[1].headers.get("x-request-id")
+    );
+}
+
+#[tokio::test]
+async fn token_file_auth_refreshes_and_replays_once_after_upstream_401() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let token_file = NamedTempFile::new().unwrap();
+    fs::write(
+        token_file.path(),
+        format!(
+            r#"{{"githubToken":"github-secret-that-must-not-log","copilotToken":"stale-copilot-token-that-must-not-log","expiresAt":{}}}"#,
+            future_epoch_seconds()
+        ),
+    )
+    .unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let refreshed_future = future_epoch_seconds();
+    let upstream_sse = "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+    let mock = spawn_router({
+        let recorded = recorded.clone();
+        let attempts = attempts.clone();
+        let upstream_sse = upstream_sse.to_owned();
+        Router::new()
+            .route(
+                "/responses",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let recorded = recorded.clone();
+                    let attempts = attempts.clone();
+                    let upstream_sse = upstream_sse.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        recorded.lock().unwrap().push(RecordedRequest {
+                            headers,
+                            body: body.to_vec(),
+                        });
+                        if attempt == 0 {
+                            Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Body::from("old token rejected"))
+                                .unwrap()
+                        } else {
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .body(Body::from(upstream_sse))
+                                .unwrap()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/copilot_internal/v2/token",
+                get(move || async move {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        format!(
+                            r#"{{"token":"fresh-copilot-token-that-must-not-log","expires_at":{refreshed_future}}}"#
+                        ),
+                    )
+                }),
+            )
+    })
+    .await;
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    config.auth.bearer_token = None;
+    config.auth.token_file = token_file.path().to_path_buf();
+    config.auth.copilot_token_url = mock.url("/copilot_internal/v2/token");
+    enable_raw_log(&mut config, &raw_log);
+    let server = spawn_app(config).await;
+    let request_body = br#"{"model":"gpt-test","input":"auth-retry-body-secret"}"#;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body(request_body.as_slice().to_vec())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, upstream_sse);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let requests = recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, request_body);
+    assert_eq!(requests[1].body, request_body);
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        "Bearer stale-copilot-token-that-must-not-log"
+    );
+    assert_eq!(
+        requests[1].headers.get("authorization").unwrap(),
+        "Bearer fresh-copilot-token-that-must-not-log"
+    );
+
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(token_file.path()).unwrap()).unwrap();
+    assert_eq!(saved["githubToken"], "github-secret-that-must-not-log");
+    assert_eq!(
+        saved["copilotToken"],
+        "fresh-copilot-token-that-must-not-log"
+    );
+    assert_eq!(saved["expiresAt"], refreshed_future);
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("upstream_auth_refresh_retry"));
+    assert!(text.contains("auth_refreshed"));
+    assert_no_log_secret(&text, "github-secret-that-must-not-log");
+    assert_no_log_secret(&text, "stale-copilot-token-that-must-not-log");
+    assert_no_log_secret(&text, "fresh-copilot-token-that-must-not-log");
+    assert_no_log_secret(&text, "auth-retry-body-secret");
+    let inbound = raw_event_fields(&text, "inbound_request");
+    let retry = raw_event_fields(&text, "upstream_auth_refresh_retry");
+    let ready = raw_event_fields(&text, "upstream_response_ready");
+    assert_eq!(retry.len(), 1);
+    assert_eq!(retry[0]["status"], StatusCode::UNAUTHORIZED.as_u16());
+    assert_eq!(retry[0]["local_id"], inbound[0]["local_id"]);
+    assert_eq!(ready[0]["local_id"], inbound[0]["local_id"]);
+    assert_eq!(ready[0]["status"], StatusCode::OK.as_u16());
+    assert_eq!(ready[0]["attempt_count"], 2);
+}
+
+#[tokio::test]
+async fn token_file_auth_refresh_after_401_is_bounded_to_one_retry() {
+    let token_file = NamedTempFile::new().unwrap();
+    fs::write(
+        token_file.path(),
+        format!(
+            r#"{{"githubToken":"github-secret","copilotToken":"stale-copilot-token","expiresAt":{}}}"#,
+            future_epoch_seconds()
+        ),
+    )
+    .unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let refreshed_future = future_epoch_seconds();
+    let mock = spawn_router({
+        let recorded = recorded.clone();
+        let attempts = attempts.clone();
+        Router::new()
+            .route(
+                "/responses",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let recorded = recorded.clone();
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        recorded.lock().unwrap().push(RecordedRequest {
+                            headers,
+                            body: body.to_vec(),
+                        });
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .body(Body::from(format!("rejected attempt {attempt}")))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/copilot_internal/v2/token",
+                get(move || async move {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        format!(
+                            r#"{{"token":"fresh-but-rejected","expires_at":{refreshed_future}}}"#
+                        ),
+                    )
+                }),
+            )
+    })
+    .await;
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    config.auth.bearer_token = None;
+    config.auth.token_file = token_file.path().to_path_buf();
+    config.auth.copilot_token_url = mock.url("/copilot_internal/v2/token");
+    let server = spawn_app(config).await;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, "rejected attempt 1");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let requests = recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        "Bearer stale-copilot-token"
+    );
+    assert_eq!(
+        requests[1].headers.get("authorization").unwrap(),
+        "Bearer fresh-but-rejected"
+    );
+}
+
+#[tokio::test]
+async fn non_token_file_auth_returns_401_without_reactive_refresh() {
+    let env_attempts = Arc::new(AtomicUsize::new(0));
+    let env_mock = spawn_router({
+        let env_attempts = env_attempts.clone();
+        Router::new().route(
+            "/responses",
+            post(move || {
+                let env_attempts = env_attempts.clone();
+                async move {
+                    env_attempts.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::UNAUTHORIZED, "env token rejected")
+                }
+            }),
+        )
+    })
+    .await;
+    let env_server = spawn_app(test_config(
+        env_mock.url("/models"),
+        env_mock.url("/responses"),
+    ))
+    .await;
+
+    let env_response = reqwest::Client::new()
+        .post(env_server.url("/v1/responses"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(env_response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(env_response.text().await.unwrap(), "env token rejected");
+    assert_eq!(env_attempts.load(Ordering::SeqCst), 1);
+
+    let incoming_recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+    let incoming_attempts = Arc::new(AtomicUsize::new(0));
+    let incoming_mock = spawn_router({
+        let incoming_recorded = incoming_recorded.clone();
+        let incoming_attempts = incoming_attempts.clone();
+        Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let incoming_recorded = incoming_recorded.clone();
+                let incoming_attempts = incoming_attempts.clone();
+                async move {
+                    incoming_attempts.fetch_add(1, Ordering::SeqCst);
+                    incoming_recorded.lock().unwrap().push(RecordedRequest {
+                        headers,
+                        body: body.to_vec(),
+                    });
+                    (StatusCode::UNAUTHORIZED, "incoming token rejected")
+                }
+            }),
+        )
+    })
+    .await;
+    let mut incoming_config = test_config(
+        incoming_mock.url("/models"),
+        incoming_mock.url("/responses"),
+    );
+    incoming_config.auth.bearer_token = None;
+    incoming_config.auth.token_file = PathBuf::from("/definitely/not/present");
+    let incoming_server = spawn_app(incoming_config).await;
+
+    let incoming_response = reqwest::Client::new()
+        .post(incoming_server.url("/v1/responses"))
+        .header("authorization", "Bearer incoming-token")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(incoming_response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        incoming_response.text().await.unwrap(),
+        "incoming token rejected"
+    );
+    assert_eq!(incoming_attempts.load(Ordering::SeqCst), 1);
+    let incoming_requests = incoming_recorded.lock().unwrap();
+    assert_eq!(incoming_requests.len(), 1);
+    assert_eq!(
+        incoming_requests[0].headers.get("authorization").unwrap(),
+        "Bearer incoming-token"
     );
 }
 
