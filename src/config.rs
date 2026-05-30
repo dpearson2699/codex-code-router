@@ -1,4 +1,6 @@
+use crate::redaction::redact_url;
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,6 +13,7 @@ pub const DEFAULT_GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/devic
 pub const DEFAULT_GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 pub const DEFAULT_GITHUB_OAUTH_CLIENT_ID: &str = "01ab8ac9400c4e429b23";
 pub const DEFAULT_GITHUB_OAUTH_SCOPE: &str = "read:user";
+pub const DEFAULT_RAW_LOG_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -22,16 +25,17 @@ pub struct AppConfig {
     pub headers: CopilotHeaderConfig,
     pub auth: AuthConfig,
     pub rate_limit: RateLimitConfig,
+    pub raw_log: RawLogConfig,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CopilotHeaderConfig {
     pub copilot_chat_version: String,
     pub copilot_editor_version: String,
     pub github_api_version: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuthConfig {
     pub bearer_token: Option<String>,
     pub token_file: PathBuf,
@@ -50,6 +54,46 @@ pub struct RateLimitConfig {
     pub max_sleep: Duration,
     pub initial_backoff: Duration,
     pub backoff_multiplier: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawLogConfig {
+    pub enabled: bool,
+    pub file: PathBuf,
+    pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppConfigSummary {
+    pub endpoint: String,
+    pub upstream_responses_url: String,
+    pub upstream_models_url: String,
+    pub request_timeout_ms: u128,
+    pub headers: CopilotHeaderConfig,
+    pub auth: AuthConfigSummary,
+    pub rate_limit: RateLimitConfigSummary,
+    pub raw_log: RawLogConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthConfigSummary {
+    pub bearer_token_configured: bool,
+    pub token_file: PathBuf,
+    pub token_expiry_buffer_seconds: u64,
+    pub refresh_enabled: bool,
+    pub copilot_token_url: String,
+    pub github_device_code_url: String,
+    pub github_access_token_url: String,
+    pub github_oauth_client_id_configured: bool,
+    pub github_oauth_scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitConfigSummary {
+    pub max_total_wait_ms: Option<u128>,
+    pub max_sleep_ms: u128,
+    pub initial_backoff_ms: u128,
+    pub backoff_multiplier: String,
 }
 
 impl AppConfig {
@@ -94,6 +138,61 @@ impl AppConfig {
                 initial_backoff: read_duration_ms("RATE_LIMIT_INITIAL_BACKOFF_MS", 1_000),
                 backoff_multiplier: read_f64("RATE_LIMIT_BACKOFF_MULTIPLIER", 2.0, 1.0),
             },
+            raw_log: RawLogConfig {
+                enabled: read_bool("CODEX_CODE_ROUTER_RAW_LOG", false),
+                file: read_raw_log_file_path(),
+                max_bytes: read_usize(
+                    "CODEX_CODE_ROUTER_RAW_LOG_MAX_BYTES",
+                    DEFAULT_RAW_LOG_MAX_BYTES,
+                    1024,
+                ),
+            },
+        }
+    }
+
+    pub fn safe_summary(&self) -> AppConfigSummary {
+        AppConfigSummary {
+            endpoint: format!("http://{}:{}", self.host, self.port),
+            upstream_responses_url: redact_url(&self.upstream_responses_url),
+            upstream_models_url: redact_url(&self.upstream_models_url),
+            request_timeout_ms: self.request_timeout.as_millis(),
+            headers: self.headers.clone(),
+            auth: self.auth.safe_summary(),
+            rate_limit: self.rate_limit.safe_summary(),
+            raw_log: self.raw_log.clone(),
+        }
+    }
+}
+
+impl AuthConfig {
+    pub fn safe_summary(&self) -> AuthConfigSummary {
+        AuthConfigSummary {
+            bearer_token_configured: self.bearer_token.is_some(),
+            token_file: self.token_file.clone(),
+            token_expiry_buffer_seconds: self.token_expiry_buffer.as_secs(),
+            refresh_enabled: self.refresh_enabled,
+            copilot_token_url: redact_url(&self.copilot_token_url),
+            github_device_code_url: redact_url(&self.github_device_code_url),
+            github_access_token_url: redact_url(&self.github_access_token_url),
+            github_oauth_client_id_configured: !self.github_oauth_client_id.is_empty(),
+            github_oauth_scope: self.github_oauth_scope.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.safe_summary().fmt(f)
+    }
+}
+
+impl RateLimitConfig {
+    pub fn safe_summary(&self) -> RateLimitConfigSummary {
+        RateLimitConfigSummary {
+            max_total_wait_ms: self.max_total_wait.map(|value| value.as_millis()),
+            max_sleep_ms: self.max_sleep.as_millis(),
+            initial_backoff_ms: self.initial_backoff.as_millis(),
+            backoff_multiplier: self.backoff_multiplier.to_string(),
         }
     }
 }
@@ -152,6 +251,14 @@ fn read_f64(name: &str, fallback: f64, minimum: f64) -> f64 {
         .unwrap_or(fallback)
 }
 
+fn read_usize(name: &str, fallback: usize, minimum: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= minimum)
+        .unwrap_or(fallback)
+}
+
 fn read_bool(name: &str, fallback: bool) -> bool {
     env::var(name)
         .ok()
@@ -173,4 +280,97 @@ fn read_token_file_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".copilot-tokens.json")
+}
+
+fn read_raw_log_file_path() -> PathBuf {
+    if let Some(path) = read_optional_string("CODEX_CODE_ROUTER_RAW_LOG_FILE") {
+        return PathBuf::from(path);
+    }
+
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex-code-router")
+        .join("raw")
+        .join("diagnostics.jsonl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_debug_and_summary_do_not_expose_bearer_token() {
+        let auth = AuthConfig {
+            bearer_token: Some("Bearer secret-token-that-must-not-log".to_owned()),
+            token_file: PathBuf::from("/tmp/copilot-tokens.json"),
+            token_expiry_buffer: Duration::from_secs(300),
+            refresh_enabled: true,
+            copilot_token_url: "https://api.example.test/token?access_token=secret".to_owned(),
+            github_device_code_url: "https://github.example.test/device?device_code=secret"
+                .to_owned(),
+            github_access_token_url: "https://github.example.test/access?client_secret=secret"
+                .to_owned(),
+            github_oauth_client_id: "client-id-not-secret-but-not-needed".to_owned(),
+            github_oauth_scope: "read:user".to_owned(),
+        };
+
+        let debug = format!("{auth:?}");
+        let summary = format!("{:?}", auth.safe_summary());
+
+        for text in [debug, summary] {
+            assert!(text.contains("bearer_token_configured: true"));
+            assert!(!text.contains("secret-token-that-must-not-log"));
+            assert!(!text.contains("access_token=secret"));
+            assert!(!text.contains("device_code=secret"));
+            assert!(!text.contains("client_secret=secret"));
+            assert!(!text.contains("client-id-not-secret-but-not-needed"));
+        }
+    }
+
+    #[test]
+    fn app_config_summary_uses_redacted_urls() {
+        let config = AppConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 60001,
+            upstream_responses_url: "https://api.example.test/responses?token=secret".to_owned(),
+            upstream_models_url: "https://api.example.test/models?secret=value".to_owned(),
+            request_timeout: Duration::from_secs(30),
+            headers: CopilotHeaderConfig {
+                copilot_chat_version: "test-chat".to_owned(),
+                copilot_editor_version: "vscode/test".to_owned(),
+                github_api_version: "2025-10-01".to_owned(),
+            },
+            auth: AuthConfig {
+                bearer_token: Some("secret-token".to_owned()),
+                token_file: PathBuf::from("/tmp/copilot-tokens.json"),
+                token_expiry_buffer: Duration::from_secs(300),
+                refresh_enabled: true,
+                copilot_token_url: DEFAULT_COPILOT_TOKEN_URL.to_owned(),
+                github_device_code_url: DEFAULT_GITHUB_DEVICE_CODE_URL.to_owned(),
+                github_access_token_url: DEFAULT_GITHUB_ACCESS_TOKEN_URL.to_owned(),
+                github_oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_owned(),
+                github_oauth_scope: DEFAULT_GITHUB_OAUTH_SCOPE.to_owned(),
+            },
+            rate_limit: RateLimitConfig {
+                max_total_wait: None,
+                max_sleep: Duration::from_secs(60),
+                initial_backoff: Duration::from_secs(1),
+                backoff_multiplier: 2.0,
+            },
+            raw_log: RawLogConfig {
+                enabled: true,
+                file: PathBuf::from("/tmp/raw.jsonl"),
+                max_bytes: 4096,
+            },
+        };
+
+        let summary = format!("{:?}", config.safe_summary());
+
+        assert!(summary.contains("https://api.example.test/responses"));
+        assert!(summary.contains("https://api.example.test/models"));
+        assert!(!summary.contains("secret-token"));
+        assert!(!summary.contains("token=secret"));
+        assert!(!summary.contains("secret=value"));
+    }
 }
