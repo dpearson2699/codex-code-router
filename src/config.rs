@@ -14,6 +14,38 @@ pub const DEFAULT_GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oaut
 pub const DEFAULT_GITHUB_OAUTH_CLIENT_ID: &str = "01ab8ac9400c4e429b23";
 pub const DEFAULT_GITHUB_OAUTH_SCOPE: &str = "read:user";
 pub const DEFAULT_RAW_LOG_MAX_BYTES: usize = 64 * 1024;
+pub const DEFAULT_RAW_LOG_CONTENT_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawLogLevel {
+    Off,
+    Metadata,
+    ContentRedacted,
+    FullContent,
+}
+
+impl RawLogLevel {
+    pub fn allows_metadata(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn allows_content(self) -> bool {
+        matches!(self, Self::ContentRedacted | Self::FullContent)
+    }
+
+    pub fn is_full_content(self) -> bool {
+        matches!(self, Self::FullContent)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Metadata => "metadata",
+            Self::ContentRedacted => "content_redacted",
+            Self::FullContent => "full_content",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -58,9 +90,10 @@ pub struct RateLimitConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawLogConfig {
-    pub enabled: bool,
+    pub level: RawLogLevel,
     pub file: PathBuf,
     pub max_bytes: usize,
+    pub content_max_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,11 +172,16 @@ impl AppConfig {
                 backoff_multiplier: read_f64("RATE_LIMIT_BACKOFF_MULTIPLIER", 2.0, 1.0),
             },
             raw_log: RawLogConfig {
-                enabled: read_bool("CODEX_CODE_ROUTER_RAW_LOG", false),
+                level: read_raw_log_level("CODEX_CODE_ROUTER_RAW_LOG_LEVEL"),
                 file: read_raw_log_file_path(),
                 max_bytes: read_usize(
                     "CODEX_CODE_ROUTER_RAW_LOG_MAX_BYTES",
                     DEFAULT_RAW_LOG_MAX_BYTES,
+                    1024,
+                ),
+                content_max_bytes: read_usize(
+                    "CODEX_CODE_ROUTER_RAW_LOG_CONTENT_MAX_BYTES",
+                    DEFAULT_RAW_LOG_CONTENT_MAX_BYTES,
                     1024,
                 ),
             },
@@ -271,6 +309,30 @@ fn read_bool(name: &str, fallback: bool) -> bool {
         .unwrap_or(fallback)
 }
 
+fn read_raw_log_level(name: &str) -> RawLogLevel {
+    let raw = env::var(name).ok().unwrap_or_default();
+    if raw.trim().is_empty() {
+        return RawLogLevel::Off;
+    }
+
+    parse_raw_log_level(&raw).unwrap_or_else(|| {
+        panic!(
+            "Invalid value for {name}: {}. Expected one of: off, metadata, content_redacted, full_content",
+            raw.trim()
+        )
+    })
+}
+
+fn parse_raw_log_level(raw: &str) -> Option<RawLogLevel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(RawLogLevel::Off),
+        "metadata" => Some(RawLogLevel::Metadata),
+        "content_redacted" => Some(RawLogLevel::ContentRedacted),
+        "full_content" => Some(RawLogLevel::FullContent),
+        _ => None,
+    }
+}
+
 fn read_token_file_path() -> PathBuf {
     if let Some(path) = read_optional_string("COPILOT_TOKEN_FILE") {
         return PathBuf::from(path);
@@ -359,9 +421,10 @@ mod tests {
                 backoff_multiplier: 2.0,
             },
             raw_log: RawLogConfig {
-                enabled: true,
+                level: RawLogLevel::Metadata,
                 file: PathBuf::from("/tmp/raw.jsonl"),
                 max_bytes: 4096,
+                content_max_bytes: 2048,
             },
         };
 
@@ -372,5 +435,30 @@ mod tests {
         assert!(!summary.contains("secret-token"));
         assert!(!summary.contains("token=secret"));
         assert!(!summary.contains("secret=value"));
+    }
+
+    #[test]
+    fn parse_raw_log_level_accepts_documented_values() {
+        assert_eq!(parse_raw_log_level("off"), Some(RawLogLevel::Off));
+        assert_eq!(parse_raw_log_level("metadata"), Some(RawLogLevel::Metadata));
+        assert_eq!(
+            parse_raw_log_level("content_redacted"),
+            Some(RawLogLevel::ContentRedacted)
+        );
+        assert_eq!(
+            parse_raw_log_level("full_content"),
+            Some(RawLogLevel::FullContent)
+        );
+        assert_eq!(
+            parse_raw_log_level("  FULL_CONTENT  "),
+            Some(RawLogLevel::FullContent)
+        );
+    }
+
+    #[test]
+    fn parse_raw_log_level_rejects_invalid_values() {
+        assert_eq!(parse_raw_log_level(""), None);
+        assert_eq!(parse_raw_log_level("enabled"), None);
+        assert_eq!(parse_raw_log_level("metadata-plus"), None);
     }
 }

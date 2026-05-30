@@ -152,15 +152,7 @@ fn start_service_with_paths(config: &AppConfig, paths: &ServicePaths) -> Result<
             ("log_path", paths.log_file.display().to_string()),
             ("executable", exe.display().to_string()),
             ("logging_mode", selected_logging_mode().to_owned()),
-            (
-                "raw_diagnostics",
-                if config.raw_log.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-                .to_owned(),
-            ),
+            ("raw_diagnostics", config.raw_log.level.as_str().to_owned()),
         ],
     );
     let mut command = Command::new(exe);

@@ -92,3 +92,18 @@ Before changing code, read:
 - Never log GitHub OAuth tokens.
 - Redact sensitive headers in diagnostics and future request dumps.
 - `codex-code-router print-token` stdout must contain only the token for Codex command-backed auth; diagnostics go to stderr.
+
+## Debug helper: verify reasoning effort in raw diagnostics
+
+When raw diagnostics are enabled and a task needs proof that Codex effort reached the proxy request, use the tightened request snapshot schema:
+
+- event kind: `inbound_request_content`
+- path: `fields.snapshot.extracted.reasoning_effort`
+
+Level semantics:
+
+- `metadata`: no content snapshot event
+- `content_redacted`: value is `<redacted-content>`
+- `full_content`: concrete effort value is visible (for example `high`)
+
+Correlate with `fields.local_id` across `inbound_request`, `upstream_response_ready`, and stream terminal events for a full request trace.

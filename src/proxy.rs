@@ -1,5 +1,7 @@
 use crate::config::AppConfig;
-use crate::diagnostics::write_raw_event;
+use crate::diagnostics::{
+    request_content_snapshot, response_content_snapshot, write_raw_content_event, write_raw_event,
+};
 use crate::headers::{build_upstream_headers, forwarded_codex_header_names};
 use crate::redaction::{hash_and_truncate, redact_headers, redact_url, truncate_for_log};
 use crate::retry::{retry_budget_exceeded, select_retry_wait};
@@ -75,12 +77,19 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         config = ?config_summary,
         "codex-code-router listening"
     );
-    if state.config.raw_log.enabled {
+    if state.config.raw_log.level.allows_metadata() {
         warn!(
             raw_log_file = %state.config.raw_log.file.display(),
             max_bytes = state.config.raw_log.max_bytes,
-            "raw diagnostics are enabled; metadata is redacted and bounded but may still reveal request/tool context"
+            level = state.config.raw_log.level.as_str(),
+            "raw diagnostics are enabled; logs may reveal request/tool context"
         );
+        if state.config.raw_log.level.allows_content() {
+            warn!(
+                level = state.config.raw_log.level.as_str(),
+                "content-level raw diagnostics are enabled; keep this mode temporary and treat logs as sensitive"
+            );
+        }
     }
 
     axum::serve(listener, app(state))
@@ -200,6 +209,17 @@ async fn forward(
             "forwarded_codex_headers": forwarded_codex_headers,
         }),
     );
+    if let Some(body) = &body {
+        write_raw_content_event(
+            &state.config.raw_log,
+            "inbound_request_content",
+            json!({
+                "local_id": &local_id,
+                "target": target.as_str(),
+                "snapshot": request_content_snapshot(&state.config.raw_log, body),
+            }),
+        );
+    }
 
     let authorization = match resolve_upstream_authorization(
         &state.config.auth,
@@ -372,6 +392,18 @@ async fn forward(
                     "elapsed_ms": elapsed.as_millis(),
                 }),
             );
+            if let Some(content_length) = upstream.content_length() {
+                write_raw_content_event(
+                    &state.config.raw_log,
+                    "upstream_response_content_hint",
+                    json!({
+                        "local_id": &local_id,
+                        "target": target.as_str(),
+                        "status": status.as_u16(),
+                        "content_length": content_length,
+                    }),
+                );
+            }
             return response_from_upstream(
                 upstream,
                 state.config.raw_log.clone(),
@@ -574,6 +606,7 @@ struct LoggedByteStream<S> {
     started: Instant,
     chunk_count: u64,
     byte_count: u64,
+    captured_preview: Vec<u8>,
     completed: bool,
 }
 
@@ -594,6 +627,7 @@ impl<S> LoggedByteStream<S> {
             started: Instant::now(),
             chunk_count: 0,
             byte_count: 0,
+            captured_preview: Vec::new(),
             completed: false,
         }
     }
@@ -610,6 +644,16 @@ where
             Poll::Ready(Some(Ok(chunk))) => {
                 self.chunk_count = self.chunk_count.saturating_add(1);
                 self.byte_count = self.byte_count.saturating_add(chunk.len() as u64);
+                if self.raw_log.level.allows_content()
+                    && self.captured_preview.len() < self.raw_log.content_max_bytes
+                {
+                    let remaining = self
+                        .raw_log
+                        .content_max_bytes
+                        .saturating_sub(self.captured_preview.len());
+                    let to_copy = remaining.min(chunk.len());
+                    self.captured_preview.extend_from_slice(&chunk[..to_copy]);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -640,6 +684,17 @@ where
                         "error": safe_reqwest_error(&error),
                     }),
                 );
+                write_raw_content_event(
+                    &self.raw_log,
+                    "upstream_response_content",
+                    json!({
+                        "local_id": &self.local_id,
+                        "target": self.target.as_str(),
+                        "status": self.status,
+                        "snapshot": response_content_snapshot(&self.raw_log, &self.captured_preview),
+                        "source": "stream_error",
+                    }),
+                );
                 Poll::Ready(Some(Err(std::io::Error::other(error))))
             }
             Poll::Ready(None) => {
@@ -664,6 +719,17 @@ where
                         "chunk_count": self.chunk_count,
                         "byte_count": self.byte_count,
                         "elapsed_ms": elapsed.as_millis(),
+                    }),
+                );
+                write_raw_content_event(
+                    &self.raw_log,
+                    "upstream_response_content",
+                    json!({
+                        "local_id": &self.local_id,
+                        "target": self.target.as_str(),
+                        "status": self.status,
+                        "snapshot": response_content_snapshot(&self.raw_log, &self.captured_preview),
+                        "source": "stream_completed",
                     }),
                 );
                 Poll::Ready(None)
@@ -698,6 +764,17 @@ impl<S> Drop for LoggedByteStream<S> {
                 "chunk_count": self.chunk_count,
                 "byte_count": self.byte_count,
                 "elapsed_ms": elapsed.as_millis(),
+            }),
+        );
+        write_raw_content_event(
+            &self.raw_log,
+            "upstream_response_content",
+            json!({
+                "local_id": &self.local_id,
+                "target": self.target.as_str(),
+                "status": self.status,
+                "snapshot": response_content_snapshot(&self.raw_log, &self.captured_preview),
+                "source": "stream_dropped",
             }),
         );
     }

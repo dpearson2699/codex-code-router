@@ -153,7 +153,7 @@ RUST_LOG=codex_code_router=debug,warn ccrx restart
 Raw diagnostics are **off by default** and are intended only for deep debugging. Enable them explicitly:
 
 ```sh
-CODEX_CODE_ROUTER_RAW_LOG=1 ccrx restart
+CODEX_CODE_ROUTER_RAW_LOG_LEVEL=metadata ccrx restart
 ```
 
 By default, raw diagnostic metadata is appended to:
@@ -165,15 +165,44 @@ By default, raw diagnostic metadata is appended to:
 You can override the path and per-event cap:
 
 ```sh
-CODEX_CODE_ROUTER_RAW_LOG=1 \
+CODEX_CODE_ROUTER_RAW_LOG_LEVEL=content_redacted \
 CODEX_CODE_ROUTER_RAW_LOG_FILE=/tmp/codex-code-router-raw.jsonl \
 CODEX_CODE_ROUTER_RAW_LOG_MAX_BYTES=65536 \
+CODEX_CODE_ROUTER_RAW_LOG_CONTENT_MAX_BYTES=16384 \
 ccrx restart
 ```
 
-Raw diagnostics currently record bounded/redacted metadata only, not body bytes. Treat the file as sensitive anyway: metadata can still reveal request timing, model choices, tool names, or other workflow context.
+Raw diagnostics support four levels:
+
+- `off` (default): no raw diagnostic JSONL events
+- `metadata`: lifecycle/retry/stream metadata only (no body content)
+- `content_redacted`: request/response content snapshots with all string values redacted
+- `full_content`: request/response content snapshots with sensitive token-like fields still redacted
+
+Treat the raw file as sensitive in all non-`off` modes.
 
 Body capture is intentionally not enabled by normal `debug` logging. If it is ever added, it must be separately opt-in, size-limited, redacted, and stored outside the normal service log.
+
+### Helper: verify Codex reasoning effort in raw diagnostics
+
+When you need to confirm that Codex-selected effort (for example `high`) reached the local proxy request, inspect `inbound_request_content` events.
+
+Event and JSON paths:
+
+- Event kind: `inbound_request_content`
+- Path: `fields.snapshot.extracted.reasoning_effort`
+- Related paths:
+  - `fields.snapshot.extracted.model`
+  - `fields.snapshot.extracted.tools.count`
+  - `fields.snapshot.extracted.tools.names`
+
+Expected behavior by `CODEX_CODE_ROUTER_RAW_LOG_LEVEL`:
+
+- `metadata`: no `inbound_request_content` events
+- `content_redacted`: `reasoning_effort` appears as `<redacted-content>`
+- `full_content`: `reasoning_effort` shows the concrete value (for example `high`)
+
+Tip: use `local_id` in each event to correlate request lifecycle entries (`inbound_request`, `upstream_response_ready`, `upstream_stream_completed`) with the corresponding content snapshot.
 
 ### Diagnosing a hanging Codex request
 
@@ -280,9 +309,10 @@ Then use Codex separately with the `copilot` profile when you want the Copilot-b
 | `RATE_LIMIT_INITIAL_BACKOFF_MS` | `1000` | Fallback initial delay when no usable rate-limit headers are present. |
 | `RATE_LIMIT_BACKOFF_MULTIPLIER` | `2` | Fallback exponential multiplier. |
 | `RUST_LOG` | unset | Optional tracing filter; when unset, `serve` uses `codex_code_router=info,warn`. |
-| `CODEX_CODE_ROUTER_RAW_LOG` | unset / false | Set to `1`, `true`, `yes`, or `on` to enable opt-in raw diagnostic JSONL metadata. |
+| `CODEX_CODE_ROUTER_RAW_LOG_LEVEL` | `off` | Raw diagnostics mode: `off`, `metadata`, `content_redacted`, or `full_content`. |
 | `CODEX_CODE_ROUTER_RAW_LOG_FILE` | `~/.codex-code-router/raw/diagnostics.jsonl` | Raw diagnostic JSONL file path. |
 | `CODEX_CODE_ROUTER_RAW_LOG_MAX_BYTES` | `65536` | Maximum bytes for one raw diagnostic event before it is replaced with a truncation marker. |
+| `CODEX_CODE_ROUTER_RAW_LOG_CONTENT_MAX_BYTES` | `16384` | Maximum bytes captured from request/response content payloads per event before truncation. |
 
 See `.env.example` for a copyable local template.
 

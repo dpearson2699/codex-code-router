@@ -76,6 +76,21 @@ pub fn truncate_json_strings(value: &Value, max_chars: usize) -> Value {
     }
 }
 
+pub fn redact_json_string_values(value: &Value) -> Value {
+    match value {
+        Value::String(_) => Value::String("<redacted-content>".to_owned()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), redact_json_string_values(value)))
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(redact_json_string_values).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 pub fn redact_url(raw: &str) -> String {
     if let Ok(mut url) = reqwest::Url::parse(raw) {
         let _ = url.set_username("");
@@ -230,6 +245,28 @@ mod tests {
         ] {
             assert!(!text.contains(leaked), "leaked {leaked}: {text}");
         }
+    }
+
+    #[test]
+    fn redacts_all_json_string_values_for_content_redacted_mode() {
+        let value = json!({
+            "model": "gpt-5.5",
+            "reasoning": {"effort": "high"},
+            "stream": true,
+            "count": 2,
+            "array": ["hello", {"tool": "calculator"}],
+        });
+
+        let redacted = redact_json_string_values(&value);
+        let text = redacted.to_string();
+
+        assert!(!text.contains("gpt-5.5"));
+        assert!(!text.contains("high"));
+        assert!(!text.contains("hello"));
+        assert!(!text.contains("calculator"));
+        assert!(text.contains("<redacted-content>"));
+        assert!(text.contains("true"));
+        assert!(text.contains("2"));
     }
 
     #[test]

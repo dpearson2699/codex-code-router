@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use codex_code_router::config::{
-    AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig, RawLogConfig,
+    AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig, RawLogConfig, RawLogLevel,
     DEFAULT_GITHUB_ACCESS_TOKEN_URL, DEFAULT_GITHUB_DEVICE_CODE_URL,
     DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE,
 };
@@ -84,9 +84,10 @@ fn test_config(models_url: String, responses_url: String) -> AppConfig {
             backoff_multiplier: 2.0,
         },
         raw_log: RawLogConfig {
-            enabled: false,
+            level: RawLogLevel::Off,
             file: PathBuf::from("/tmp/codex-code-router-test-raw.jsonl"),
             max_bytes: 4096,
+            content_max_bytes: 4096,
         },
     }
 }
@@ -96,9 +97,14 @@ async fn spawn_app(config: AppConfig) -> TestServer {
 }
 
 fn enable_raw_log(config: &mut AppConfig, file: &NamedTempFile) {
-    config.raw_log.enabled = true;
+    config.raw_log.level = RawLogLevel::Metadata;
     config.raw_log.file = file.path().to_path_buf();
     config.raw_log.max_bytes = 16 * 1024;
+    config.raw_log.content_max_bytes = 4 * 1024;
+}
+
+fn set_raw_log_level(config: &mut AppConfig, level: RawLogLevel) {
+    config.raw_log.level = level;
 }
 
 fn raw_log_text(file: &NamedTempFile) -> String {
@@ -369,6 +375,121 @@ event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
     let stream_events = raw_event_fields(&text, "upstream_stream_completed");
     assert_eq!(stream_events[0]["byte_count"], upstream_sse.len());
     assert!(stream_events[0]["chunk_count"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn responses_content_redacted_logs_structure_without_prompt_values() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let upstream_sse =
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"message\":\"provider secret\"}\n\n";
+    let mock = spawn_router({
+        let upstream_sse = upstream_sse.to_owned();
+        Router::new().route(
+            "/responses",
+            post(move || {
+                let upstream_sse = upstream_sse.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(upstream_sse))
+                        .unwrap()
+                }
+            }),
+        )
+    })
+    .await;
+
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    enable_raw_log(&mut config, &raw_log);
+    set_raw_log_level(&mut config, RawLogLevel::ContentRedacted);
+    let server = spawn_app(config).await;
+    let request_body =
+        br#"{"model":"gpt-test","reasoning":{"effort":"high"},"input":"user secret prompt"}"#;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body(request_body.as_slice().to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.unwrap();
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("inbound_request_content"));
+    assert!(text.contains("upstream_response_content"));
+    assert!(text.contains("<redacted-content>"));
+    assert_no_log_secret(&text, "user secret prompt");
+    assert_no_log_secret(&text, "high");
+    assert_no_log_secret(&text, "provider secret");
+
+    let request_content = raw_event_fields(&text, "inbound_request_content");
+    assert_eq!(request_content[0]["snapshot"]["schema_version"], 1);
+    assert_eq!(request_content[0]["snapshot"]["direction"], "request");
+    assert_eq!(
+        request_content[0]["snapshot"]["extracted"]["reasoning_effort"],
+        "<redacted-content>"
+    );
+}
+
+#[tokio::test]
+async fn responses_full_content_logs_effort_and_prompt_content() {
+    let raw_log = NamedTempFile::new().unwrap();
+    let upstream_sse =
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"message\":\"provider clear text\"}\n\n";
+    let mock = spawn_router({
+        let upstream_sse = upstream_sse.to_owned();
+        Router::new().route(
+            "/responses",
+            post(move || {
+                let upstream_sse = upstream_sse.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(upstream_sse))
+                        .unwrap()
+                }
+            }),
+        )
+    })
+    .await;
+
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    enable_raw_log(&mut config, &raw_log);
+    set_raw_log_level(&mut config, RawLogLevel::FullContent);
+    let server = spawn_app(config).await;
+    let request_body =
+        br#"{"model":"gpt-test","reasoning":{"effort":"high"},"input":"plain prompt"}"#;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body(request_body.as_slice().to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.unwrap();
+
+    let text = raw_log_text(&raw_log);
+    assert!(text.contains("inbound_request_content"));
+    assert!(text.contains("upstream_response_content"));
+    assert!(text.contains("\"reasoning_effort\":\"high\""));
+    assert!(text.contains("plain prompt"));
+    assert!(text.contains("provider clear text"));
+    assert_no_log_secret(&text, "service-owned-token");
+
+    let request_content = raw_event_fields(&text, "inbound_request_content");
+    assert_eq!(request_content[0]["snapshot"]["schema_version"], 1);
+    assert_eq!(
+        request_content[0]["snapshot"]["extracted"]["reasoning_effort"],
+        "high"
+    );
+    assert_eq!(
+        request_content[0]["snapshot"]["extracted"]["tools"]["count"],
+        0
+    );
 }
 
 #[tokio::test]
