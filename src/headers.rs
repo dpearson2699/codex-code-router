@@ -5,13 +5,21 @@ use http::header::{
 use http::{HeaderMap, HeaderName, HeaderValue};
 use thiserror::Error;
 
-const FORWARDED_CODEX_HEADERS: &[&str] = &[
+pub const FORWARDED_CODEX_HEADERS: &[&str] = &[
     "x-client-request-id",
     "x-codex-parent-thread-id",
     "x-codex-sandbox",
     "x-codex-window-id",
     "x-openai-subagent",
 ];
+
+pub fn forwarded_codex_header_names(inbound: &HeaderMap) -> Vec<&'static str> {
+    FORWARDED_CODEX_HEADERS
+        .iter()
+        .copied()
+        .filter(|header| inbound.contains_key(*header))
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum HeaderBuildError {

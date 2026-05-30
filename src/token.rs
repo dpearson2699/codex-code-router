@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -96,6 +97,46 @@ struct RefreshedCopilotToken {
     endpoint: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthSource {
+    EnvToken,
+    TokenFile {
+        path: PathBuf,
+        expires_at: Option<u64>,
+        refreshed: bool,
+    },
+    IncomingAuthorization,
+}
+
+#[derive(Clone)]
+pub struct ResolvedAuthorization {
+    header_value: String,
+    source: AuthSource,
+}
+
+impl ResolvedAuthorization {
+    pub fn header_value(&self) -> &str {
+        &self.header_value
+    }
+
+    pub fn source(&self) -> &AuthSource {
+        &self.source
+    }
+}
+
+impl std::fmt::Debug for ResolvedAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedAuthorization")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ConfiguredToken {
+    token: String,
+    source: AuthSource,
+}
+
 #[derive(Debug, Serialize)]
 struct DeviceCodeRequest<'a> {
     client_id: &'a str,
@@ -131,20 +172,29 @@ pub async fn resolve_upstream_authorization(
     headers: &CopilotHeaderConfig,
     client: &reqwest::Client,
     inbound: &HeaderMap,
-) -> Result<String, AuthError> {
+) -> Result<ResolvedAuthorization, AuthError> {
     let configured = configured_token(auth, headers, client).await;
-    if let Ok(Some(token)) = configured.as_ref() {
-        return Ok(as_authorization_header(token));
-    }
+    let configured_error = match configured {
+        Ok(Some(configured)) => {
+            return Ok(ResolvedAuthorization {
+                header_value: as_authorization_header(&configured.token),
+                source: configured.source,
+            })
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
 
     if let Some(incoming) = incoming_authorization(inbound)? {
-        return Ok(incoming);
+        return Ok(ResolvedAuthorization {
+            header_value: incoming,
+            source: AuthSource::IncomingAuthorization,
+        });
     }
 
-    match configured {
-        Err(error) => Err(error),
-        Ok(None) => Err(AuthError::Missing),
-        Ok(Some(_)) => unreachable!("configured token is returned above"),
+    match configured_error {
+        Some(error) => Err(error),
+        None => Err(AuthError::Missing),
     }
 }
 
@@ -155,6 +205,7 @@ pub async fn printable_token_from_auth_config(
 ) -> Result<String, AuthError> {
     configured_token(auth, headers, client)
         .await?
+        .map(|configured| configured.token)
         .ok_or(AuthError::Missing)
 }
 
@@ -231,14 +282,17 @@ async fn configured_token(
     auth: &AuthConfig,
     headers: &CopilotHeaderConfig,
     client: &reqwest::Client,
-) -> Result<Option<String>, AuthError> {
+) -> Result<Option<ConfiguredToken>, AuthError> {
     if let Some(token) = auth
         .bearer_token
         .as_ref()
         .map(|value| strip_bearer_prefix(value))
         .filter(|value| !value.is_empty())
     {
-        return Ok(Some(token));
+        return Ok(Some(ConfiguredToken {
+            token,
+            source: AuthSource::EnvToken,
+        }));
     }
 
     load_token_file(auth, headers, client).await
@@ -348,7 +402,7 @@ async fn load_token_file(
     auth: &AuthConfig,
     headers: &CopilotHeaderConfig,
     client: &reqwest::Client,
-) -> Result<Option<String>, AuthError> {
+) -> Result<Option<ConfiguredToken>, AuthError> {
     let path = &auth.token_file;
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -367,8 +421,17 @@ async fn load_token_file(
             source,
         })?;
 
+    let expires_at = data.expires_at.as_ref().and_then(epoch_seconds);
     if !is_expired_or_near_expiry(data.expires_at.as_ref(), auth.token_expiry_buffer) {
-        return copilot_token_from_data(path, data);
+        let configured = copilot_token_from_data(path, data, expires_at, false)?;
+        info!(
+            auth_source = "token_file",
+            path = %path.display(),
+            expires_at,
+            refreshed = false,
+            "using Copilot token from token file"
+        );
+        return Ok(Some(configured));
     }
 
     if !auth.refresh_enabled {
@@ -388,15 +451,33 @@ async fn load_token_file(
 
     let refreshed = refresh_copilot_token(auth, headers, client, &github_token).await?;
     let token = refreshed.token.clone();
+    let expires_at = Some(refreshed.expires_at);
     write_refreshed_token_file(path, data, refreshed)?;
 
-    Ok(Some(token))
+    info!(
+        auth_source = "token_file",
+        path = %path.display(),
+        expires_at,
+        refreshed = true,
+        "using refreshed Copilot token from token file"
+    );
+
+    Ok(Some(ConfiguredToken {
+        token,
+        source: AuthSource::TokenFile {
+            path: path.to_path_buf(),
+            expires_at,
+            refreshed: true,
+        },
+    }))
 }
 
 fn copilot_token_from_data(
     path: &Path,
     data: CopilotTokenFile,
-) -> Result<Option<String>, AuthError> {
+    expires_at: Option<u64>,
+    refreshed: bool,
+) -> Result<ConfiguredToken, AuthError> {
     let token = data
         .copilot_token
         .map(|value| strip_bearer_prefix(&value))
@@ -405,7 +486,14 @@ fn copilot_token_from_data(
             path: path.to_path_buf(),
         })?;
 
-    Ok(Some(token))
+    Ok(ConfiguredToken {
+        token,
+        source: AuthSource::TokenFile {
+            path: path.to_path_buf(),
+            expires_at,
+            refreshed,
+        },
+    })
 }
 
 fn is_expired_or_near_expiry(expires_at: Option<&Value>, expiry_buffer: Duration) -> bool {
@@ -662,7 +750,7 @@ mod tests {
     async fn resolved_authorization(
         auth: &AuthConfig,
         inbound: &HeaderMap,
-    ) -> Result<String, AuthError> {
+    ) -> Result<ResolvedAuthorization, AuthError> {
         let headers = header_config();
         let client = reqwest::Client::new();
         resolve_upstream_authorization(auth, &headers, &client, inbound).await
@@ -715,7 +803,9 @@ mod tests {
         let headers = HeaderMap::new();
         let auth_header = resolved_authorization(&auth, &headers).await.unwrap();
 
-        assert_eq!(auth_header, "Bearer secret-token");
+        assert_eq!(auth_header.header_value(), "Bearer secret-token");
+        assert_eq!(auth_header.source(), &AuthSource::EnvToken);
+        assert!(!format!("{auth_header:?}").contains("secret-token"));
         assert_eq!(printable_token(&auth).await.unwrap(), "secret-token");
     }
 
@@ -730,7 +820,9 @@ mod tests {
 
         let auth_header = resolved_authorization(&auth, &headers).await.unwrap();
 
-        assert_eq!(auth_header, "Bearer incoming-token");
+        assert_eq!(auth_header.header_value(), "Bearer incoming-token");
+        assert_eq!(auth_header.source(), &AuthSource::IncomingAuthorization);
+        assert!(!format!("{auth_header:?}").contains("incoming-token"));
     }
 
     #[tokio::test]
@@ -748,9 +840,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            auth_header, "Bearer file-token",
+            auth_header.header_value(),
+            "Bearer file-token",
             "Service-owned token files should win over client-supplied local Authorization."
         );
+        assert!(matches!(
+            auth_header.source(),
+            AuthSource::TokenFile {
+                refreshed: false,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

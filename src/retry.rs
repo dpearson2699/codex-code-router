@@ -14,6 +14,8 @@ pub enum WaitSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetryWait {
     pub delay: Duration,
+    pub raw_delay: Duration,
+    pub clamped: bool,
     pub source: WaitSource,
 }
 
@@ -24,30 +26,19 @@ pub fn select_retry_wait(
     now: SystemTime,
 ) -> RetryWait {
     if let Some(delay) = retry_after(headers, now) {
-        return RetryWait {
-            delay: clamp(delay, config.max_sleep),
-            source: WaitSource::RetryAfter,
-        };
+        return retry_wait(delay, config.max_sleep, WaitSource::RetryAfter);
     }
 
     if let Some(delay) = epoch_seconds_header(headers, "x-ratelimit-reset", now) {
-        return RetryWait {
-            delay: clamp(delay, config.max_sleep),
-            source: WaitSource::RateLimitReset,
-        };
+        return retry_wait(delay, config.max_sleep, WaitSource::RateLimitReset);
     }
 
     if let Some(delay) = epoch_millis_header(headers, "x-ratelimit-reset-ms", now) {
-        return RetryWait {
-            delay: clamp(delay, config.max_sleep),
-            source: WaitSource::RateLimitResetMs,
-        };
+        return retry_wait(delay, config.max_sleep, WaitSource::RateLimitResetMs);
     }
 
-    RetryWait {
-        delay: fallback_delay(retry_index, config),
-        source: WaitSource::Backoff,
-    }
+    let delay = fallback_delay(retry_index, config);
+    retry_wait(delay, config.max_sleep, WaitSource::Backoff)
 }
 
 pub fn retry_budget_exceeded(
@@ -113,6 +104,16 @@ fn fallback_delay(retry_index: u32, config: &RateLimitConfig) -> Duration {
     let millis = (config.initial_backoff.as_millis() as f64 * multiplier * jitter).round();
     let millis = millis.max(1.0).min(u64::MAX as f64) as u64;
     clamp(Duration::from_millis(millis), config.max_sleep)
+}
+
+fn retry_wait(raw_delay: Duration, max_sleep: Duration, source: WaitSource) -> RetryWait {
+    let delay = clamp(raw_delay, max_sleep);
+    RetryWait {
+        delay,
+        raw_delay,
+        clamped: raw_delay > delay,
+        source,
+    }
 }
 
 fn clamp(value: Duration, max: Duration) -> Duration {
