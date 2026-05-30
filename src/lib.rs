@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod headers;
 pub mod proxy;
 pub mod redaction;
