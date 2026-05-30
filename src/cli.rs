@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_LOG_FILTER: &str = "codex_code_router=info,warn";
+
 #[derive(Debug, Parser)]
 #[command(about = "Local Codex -> GitHub Copilot Responses API adapter")]
 struct Cli {
@@ -61,9 +63,13 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 fn init_tracing() {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_writer(io::stderr)
+        .with_ansi(false)
         .init();
 }
 
