@@ -223,6 +223,7 @@ Most users only need the Codex provider block and `ccrx login`. The settings bel
 | `GITHUB_OAUTH_CLIENT_ID` | `01ab8ac9400c4e429b23` | OAuth client ID used for device login. |
 | `GITHUB_OAUTH_SCOPE` | `read:user` | OAuth scope requested during device login. |
 | `REQUEST_TIMEOUT_MS` | `300000` | Upstream request timeout. |
+| `REQUEST_BODY_LIMIT_BYTES` | `0` | Maximum local inbound request body size before forwarding; `0` disables the local limit. |
 | `COPILOT_CHAT_VERSION` | `0.35.0` | Copilot Chat version header sent upstream. |
 | `COPILOT_EDITOR_VERSION` | `vscode/1.109.2` | Editor version header sent upstream. |
 | `GITHUB_API_VERSION` | `2025-10-01` | GitHub API version header sent upstream. |
@@ -323,6 +324,10 @@ The service still prefers its own Copilot token from `ccrx login` / `~/.copilot-
 ### Requests appear to hang
 
 Check the log path printed by `ccrx status`. If the latest entries show an upstream HTTP `429`, the adapter is waiting for GitHub Copilot's rate-limit window. By default, `RATE_LIMIT_MAX_TOTAL_WAIT_MS=0`, which allows an unlimited total wait for HTTP `429` responses.
+
+### Local `/v1/responses` returns `Payload Too Large`
+
+If Codex reports `413 Payload Too Large` with `Failed to buffer the request body: length limit exceeded` from `http://127.0.0.1:60001/v1/responses`, the local adapter rejected the request before it reached GitHub Copilot. By default, the local adapter does not impose a request body limit. If you configured `REQUEST_BODY_LIMIT_BYTES` to a finite value, set it higher or set it back to `0`, then restart the service.
 
 ## Development
 

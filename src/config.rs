@@ -13,6 +13,7 @@ pub const DEFAULT_GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/devic
 pub const DEFAULT_GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 pub const DEFAULT_GITHUB_OAUTH_CLIENT_ID: &str = "01ab8ac9400c4e429b23";
 pub const DEFAULT_GITHUB_OAUTH_SCOPE: &str = "read:user";
+pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: Option<usize> = None;
 pub const DEFAULT_RAW_LOG_MAX_BYTES: usize = 64 * 1024;
 pub const DEFAULT_RAW_LOG_CONTENT_MAX_BYTES: usize = 16 * 1024;
 
@@ -54,6 +55,7 @@ pub struct AppConfig {
     pub upstream_responses_url: String,
     pub upstream_models_url: String,
     pub request_timeout: Duration,
+    pub request_body_limit_bytes: Option<usize>,
     pub headers: CopilotHeaderConfig,
     pub auth: AuthConfig,
     pub rate_limit: RateLimitConfig,
@@ -102,6 +104,7 @@ pub struct AppConfigSummary {
     pub upstream_responses_url: String,
     pub upstream_models_url: String,
     pub request_timeout_ms: u128,
+    pub request_body_limit_bytes: Option<usize>,
     pub headers: CopilotHeaderConfig,
     pub auth: AuthConfigSummary,
     pub rate_limit: RateLimitConfigSummary,
@@ -137,6 +140,7 @@ impl AppConfig {
             upstream_responses_url: read_string("COPILOT_RESPONSES_URL", DEFAULT_RESPONSES_URL),
             upstream_models_url: read_string("COPILOT_MODELS_URL", DEFAULT_MODELS_URL),
             request_timeout: read_duration_ms("REQUEST_TIMEOUT_MS", 300_000),
+            request_body_limit_bytes: read_request_body_limit_bytes(),
             headers: CopilotHeaderConfig {
                 copilot_chat_version: read_string("COPILOT_CHAT_VERSION", "0.35.0"),
                 copilot_editor_version: read_string("COPILOT_EDITOR_VERSION", "vscode/1.109.2"),
@@ -194,6 +198,7 @@ impl AppConfig {
             upstream_responses_url: redact_url(&self.upstream_responses_url),
             upstream_models_url: redact_url(&self.upstream_models_url),
             request_timeout_ms: self.request_timeout.as_millis(),
+            request_body_limit_bytes: self.request_body_limit_bytes,
             headers: self.headers.clone(),
             auth: self.auth.safe_summary(),
             rate_limit: self.rate_limit.safe_summary(),
@@ -269,6 +274,21 @@ fn read_duration_seconds(name: &str, fallback_seconds: u64) -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(fallback_seconds);
     Duration::from_secs(value)
+}
+
+fn read_request_body_limit_bytes() -> Option<usize> {
+    env::var("REQUEST_BODY_LIMIT_BYTES")
+        .ok()
+        .and_then(|raw| parse_request_body_limit_bytes(&raw))
+        .unwrap_or(DEFAULT_REQUEST_BODY_LIMIT_BYTES)
+}
+
+fn parse_request_body_limit_bytes(raw: &str) -> Option<Option<usize>> {
+    match raw.trim().parse::<usize>().ok()? {
+        0 => Some(None),
+        value if value >= 1024 => Some(Some(value)),
+        _ => None,
+    }
 }
 
 fn read_max_total_wait() -> Option<Duration> {
@@ -398,6 +418,7 @@ mod tests {
             upstream_responses_url: "https://api.example.test/responses?token=secret".to_owned(),
             upstream_models_url: "https://api.example.test/models?secret=value".to_owned(),
             request_timeout: Duration::from_secs(30),
+            request_body_limit_bytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES,
             headers: CopilotHeaderConfig {
                 copilot_chat_version: "test-chat".to_owned(),
                 copilot_editor_version: "vscode/test".to_owned(),
@@ -460,5 +481,22 @@ mod tests {
         assert_eq!(parse_raw_log_level(""), None);
         assert_eq!(parse_raw_log_level("enabled"), None);
         assert_eq!(parse_raw_log_level("metadata-plus"), None);
+    }
+
+    #[test]
+    fn parse_request_body_limit_bytes_accepts_documented_values() {
+        assert_eq!(
+            parse_request_body_limit_bytes("67108864"),
+            Some(Some(64 * 1024 * 1024))
+        );
+        assert_eq!(parse_request_body_limit_bytes("0"), Some(None));
+        assert_eq!(parse_request_body_limit_bytes(" 2048 "), Some(Some(2048)));
+    }
+
+    #[test]
+    fn parse_request_body_limit_bytes_rejects_invalid_or_tiny_values() {
+        assert_eq!(parse_request_body_limit_bytes(""), None);
+        assert_eq!(parse_request_body_limit_bytes("not-a-number"), None);
+        assert_eq!(parse_request_body_limit_bytes("1023"), None);
     }
 }

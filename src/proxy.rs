@@ -9,7 +9,7 @@ use crate::token::{
     refresh_token_file_authorization, resolve_upstream_authorization, AuthError, AuthSource,
 };
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::Response;
@@ -57,12 +57,22 @@ impl AppState {
 }
 
 pub fn app(state: AppState) -> Router {
+    let request_body_limit_bytes = state.config.request_body_limit_bytes;
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .fallback(not_found)
+        .layer(request_body_limit_layer(request_body_limit_bytes))
         .with_state(state)
+}
+
+fn request_body_limit_layer(limit_bytes: Option<usize>) -> DefaultBodyLimit {
+    match limit_bytes {
+        Some(limit_bytes) => DefaultBodyLimit::max(limit_bytes),
+        None => DefaultBodyLimit::disable(),
+    }
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {

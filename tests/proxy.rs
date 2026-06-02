@@ -1,4 +1,5 @@
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -7,7 +8,7 @@ use bytes::Bytes;
 use codex_code_router::config::{
     AppConfig, AuthConfig, CopilotHeaderConfig, RateLimitConfig, RawLogConfig, RawLogLevel,
     DEFAULT_GITHUB_ACCESS_TOKEN_URL, DEFAULT_GITHUB_DEVICE_CODE_URL,
-    DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE,
+    DEFAULT_GITHUB_OAUTH_CLIENT_ID, DEFAULT_GITHUB_OAUTH_SCOPE, DEFAULT_REQUEST_BODY_LIMIT_BYTES,
 };
 use codex_code_router::proxy::{app, AppState};
 use futures_util::stream;
@@ -61,6 +62,7 @@ fn test_config(models_url: String, responses_url: String) -> AppConfig {
         upstream_responses_url: responses_url,
         upstream_models_url: models_url,
         request_timeout: Duration::from_secs(30),
+        request_body_limit_bytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES,
         headers: CopilotHeaderConfig {
             copilot_chat_version: "test-chat".to_owned(),
             copilot_editor_version: "vscode/test".to_owned(),
@@ -314,6 +316,86 @@ event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, request_body);
     assert_eq!(requests[0].headers.get("accept").unwrap(), "*/*");
+}
+
+#[tokio::test]
+async fn responses_proxy_accepts_body_larger_than_axum_default_limit() {
+    let recorded = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+    let mock = spawn_router(
+        Router::new()
+            .route(
+                "/responses",
+                post({
+                    let recorded = recorded.clone();
+                    move |headers: HeaderMap, body: Bytes| {
+                        let recorded = recorded.clone();
+                        async move {
+                            recorded.lock().unwrap().push(RecordedRequest {
+                                headers,
+                                body: body.to_vec(),
+                            });
+                            (StatusCode::OK, "ok")
+                        }
+                    }
+                }),
+            )
+            .layer(DefaultBodyLimit::disable()),
+    )
+    .await;
+
+    let config = test_config(mock.url("/models"), mock.url("/responses"));
+    let server = spawn_app(config).await;
+    let request_body = vec![b'x'; 2 * 1024 * 1024 + 1];
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .header("content-type", "application/json")
+        .body(request_body.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ok");
+
+    let requests = recorded.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, request_body);
+}
+
+#[tokio::test]
+async fn configured_responses_body_limit_rejects_oversized_body_before_upstream() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mock = spawn_router({
+        let attempts = attempts.clone();
+        Router::new().route(
+            "/responses",
+            post(move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, "should not be called")
+                }
+            }),
+        )
+    })
+    .await;
+
+    let mut config = test_config(mock.url("/models"), mock.url("/responses"));
+    config.request_body_limit_bytes = Some(1024);
+    let server = spawn_app(config).await;
+
+    let response = reqwest::Client::new()
+        .post(server.url("/v1/responses"))
+        .body(vec![b'x'; 1025])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
