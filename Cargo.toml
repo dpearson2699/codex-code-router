@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Minimal Codex CLI adapter for GitHub Copilot's Responses API endpoint."
+repository = "https://github.com/dpearson2699/codex-code-router"
 
 [dependencies]
 anyhow = "1"

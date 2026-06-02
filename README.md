@@ -58,6 +58,50 @@ If you do not want to install the binaries globally, you can run from the checko
 cargo run --release -- serve
 ```
 
+## Update from source
+
+After you have a version with the update command installed, the normal update flow is:
+
+```sh
+ccrx update
+```
+
+You can run that from any directory. It does not require a local checkout. By default, `ccrx update` looks up the latest GitHub Release for this repository, reinstalls both binaries from that release tag with Cargo, and restarts the background service. When possible, it infers the existing Cargo install root from the running `ccrx` binary, so the updated binaries land in the same install location. This does not require npm, crates.io, Homebrew, or prebuilt release artifacts; it builds from the Git tag locally.
+
+To update from the latest `main` branch instead of the latest GitHub Release:
+
+```sh
+ccrx update --branch main
+```
+
+To install a specific tag:
+
+```sh
+ccrx update --tag v0.1.0
+```
+
+To install without restarting immediately:
+
+```sh
+ccrx update --no-restart
+```
+
+If your installed `ccrx` is too old to have the `update` command, bootstrap once from your cloned checkout:
+
+```sh
+cd /path/to/codex-code-router
+git pull --ff-only
+cargo install --path . --bins --locked --force
+ccrx restart
+ccrx status
+```
+
+That keeps your existing Codex config and saved Copilot token file. It only updates the installed `ccrx` and `codex-code-router` binaries, then restarts the background service so Codex uses the new code. Future updates can use `ccrx update` from any folder.
+
+If the service was not already running, use `ccrx start` instead of `ccrx restart`.
+
+If `git pull --ff-only` reports local changes in your checkout, stop and review them before updating. Either commit them, stash them, or use `ccrx update --branch main` so Cargo installs from GitHub without touching your local files.
+
 ## Sign in to GitHub Copilot
 
 Run the built-in device login:
@@ -88,6 +132,7 @@ Useful service commands:
 
 ```sh
 ccrx status
+ccrx update
 ccrx restart
 ccrx stop
 ```

@@ -1,15 +1,24 @@
 use crate::config::AppConfig;
 use crate::proxy::serve;
+use crate::redaction::truncate_for_log;
 use crate::service_control::{restart_service, start_service, status_service, stop_service};
 use crate::token::{
     login_with_device_flow, printable_token_from_auth_config,
     should_try_device_login_after_auth_error,
 };
-use clap::{Parser, Subcommand};
+use anyhow::{bail, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use reqwest::header::USER_AGENT;
+use serde_json::Value;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LOG_FILTER: &str = "codex_code_router=info,warn";
+const DEFAULT_UPDATE_REPO: &str = "https://github.com/dpearson2699/codex-code-router";
+const UPDATE_USER_AGENT: &str = concat!("codex-code-router/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Parser)]
 #[command(about = "Local Codex -> GitHub Copilot Responses API adapter")]
@@ -30,10 +39,43 @@ enum Command {
     Restart,
     /// Show whether the local adapter service is reachable.
     Status,
+    /// Update installed binaries from GitHub and restart the service.
+    Update(UpdateArgs),
     /// Run interactive GitHub Copilot device login and save the token file.
     Login,
     /// Print the configured Copilot bearer token only.
     PrintToken,
+}
+
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// Git repository to install from.
+    #[arg(long, default_value = DEFAULT_UPDATE_REPO)]
+    repo: String,
+    /// Install a specific Git tag instead of the latest GitHub release.
+    #[arg(long, conflicts_with = "branch")]
+    tag: Option<String>,
+    /// Install a branch instead of the latest GitHub release.
+    #[arg(long, conflicts_with = "tag")]
+    branch: Option<String>,
+    /// Install binaries without restarting the background service.
+    #[arg(long)]
+    no_restart: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateRef {
+    Tag(String),
+    Branch(String),
+}
+
+impl UpdateRef {
+    fn description(&self) -> String {
+        match self {
+            Self::Tag(tag) => format!("tag {tag}"),
+            Self::Branch(branch) => format!("branch {branch}"),
+        }
+    }
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -57,9 +99,174 @@ pub async fn run() -> anyhow::Result<()> {
             restart_service(&config)
         }
         Command::Status => status_service(&AppConfig::from_env()),
+        Command::Update(args) => update(args).await,
         Command::Login => login().await,
         Command::PrintToken => print_token().await,
     }
+}
+
+async fn update(args: UpdateArgs) -> anyhow::Result<()> {
+    let update_ref = resolve_update_ref(&args).await?;
+    println!(
+        "updating ccrx from {} ({})",
+        args.repo,
+        update_ref.description()
+    );
+    cargo_install_from_git(&args.repo, &update_ref)?;
+    println!("installed updated ccrx binaries");
+
+    if args.no_restart {
+        println!("skipped restart; run `ccrx restart` when you want Codex to use the update");
+        return Ok(());
+    }
+
+    let config = AppConfig::from_env();
+    ensure_auth_ready_or_login(&config).await?;
+    restart_service(&config)
+}
+
+async fn resolve_update_ref(args: &UpdateArgs) -> Result<UpdateRef> {
+    if let Some(tag) = args
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+    {
+        return Ok(UpdateRef::Tag(tag.to_owned()));
+    }
+    if let Some(branch) = args
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        return Ok(UpdateRef::Branch(branch.to_owned()));
+    }
+
+    fetch_latest_release_tag(&args.repo)
+        .await
+        .map(UpdateRef::Tag)
+}
+
+async fn fetch_latest_release_tag(repo: &str) -> Result<String> {
+    let api_url = github_latest_release_api_url(repo)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let response = client
+        .get(&api_url)
+        .header(USER_AGENT, UPDATE_USER_AGENT)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch latest GitHub release from {api_url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "failed to fetch latest GitHub release from {api_url}: HTTP {status}. Create a GitHub release, pass `--tag <tag>`, or use `--branch main`. {}",
+            truncate_for_log(&body, 240)
+        );
+    }
+
+    let value: Value = response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse GitHub release response from {api_url}"))?;
+    value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("GitHub latest release response did not include tag_name"))
+}
+
+fn github_latest_release_api_url(repo: &str) -> Result<String> {
+    let repo = repo.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = if let Some(path) = repo.strip_prefix("https://github.com/") {
+        path
+    } else if let Some(path) = repo.strip_prefix("http://github.com/") {
+        path
+    } else if let Some(path) = repo.strip_prefix("git@github.com:") {
+        path
+    } else {
+        bail!(
+            "cannot discover latest GitHub release for `{repo}`. Use a github.com repo URL, pass `--tag <tag>`, or use `--branch main`."
+        );
+    };
+
+    let mut parts = path.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() {
+        bail!("invalid GitHub repo URL `{repo}`");
+    }
+
+    Ok(format!(
+        "https://api.github.com/repos/{owner}/{name}/releases/latest"
+    ))
+}
+
+fn cargo_install_from_git(repo: &str, update_ref: &UpdateRef) -> Result<()> {
+    let install_root = current_install_root();
+    if let Some(root) = &install_root {
+        println!("install root: {}", root.display());
+    } else {
+        println!("install root: cargo default");
+    }
+
+    let args = cargo_install_args(repo, update_ref, install_root.as_deref());
+    println!("running: cargo {}", args.join(" "));
+
+    let status = ProcessCommand::new("cargo")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to run cargo install")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("cargo install failed with status {status}")
+    }
+}
+
+fn current_install_root() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| install_root_from_exe_path(&exe))
+}
+
+fn install_root_from_exe_path(exe: &Path) -> Option<PathBuf> {
+    let bin_dir = exe.parent()?;
+    if bin_dir.file_name().and_then(|name| name.to_str()) != Some("bin") {
+        return None;
+    }
+
+    bin_dir.parent().map(Path::to_path_buf)
+}
+
+fn cargo_install_args(
+    repo: &str,
+    update_ref: &UpdateRef,
+    install_root: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec!["install".to_owned(), "--git".to_owned(), repo.to_owned()];
+    match update_ref {
+        UpdateRef::Tag(tag) => args.extend(["--tag".to_owned(), tag.to_owned()]),
+        UpdateRef::Branch(branch) => args.extend(["--branch".to_owned(), branch.to_owned()]),
+    }
+    if let Some(root) = install_root {
+        args.extend(["--root".to_owned(), root.display().to_string()]);
+    }
+    args.extend([
+        "--bins".to_owned(),
+        "--locked".to_owned(),
+        "--force".to_owned(),
+    ]);
+    args
 }
 
 fn init_tracing() {
@@ -114,5 +321,109 @@ async fn ensure_auth_ready_or_login(config: &AppConfig) -> anyhow::Result<()> {
             Ok(())
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_latest_release_api_url_accepts_https_repo_urls() {
+        assert_eq!(
+            github_latest_release_api_url("https://github.com/dpearson2699/codex-code-router.git")
+                .unwrap(),
+            "https://api.github.com/repos/dpearson2699/codex-code-router/releases/latest"
+        );
+    }
+
+    #[test]
+    fn github_latest_release_api_url_accepts_ssh_repo_urls() {
+        assert_eq!(
+            github_latest_release_api_url("git@github.com:dpearson2699/codex-code-router.git")
+                .unwrap(),
+            "https://api.github.com/repos/dpearson2699/codex-code-router/releases/latest"
+        );
+    }
+
+    #[test]
+    fn cargo_install_args_use_release_tag() {
+        assert_eq!(
+            cargo_install_args(
+                DEFAULT_UPDATE_REPO,
+                &UpdateRef::Tag("v0.1.0".to_owned()),
+                None,
+            ),
+            vec![
+                "install",
+                "--git",
+                DEFAULT_UPDATE_REPO,
+                "--tag",
+                "v0.1.0",
+                "--bins",
+                "--locked",
+                "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_install_args_can_use_branch() {
+        assert_eq!(
+            cargo_install_args(
+                DEFAULT_UPDATE_REPO,
+                &UpdateRef::Branch("main".to_owned()),
+                None,
+            ),
+            vec![
+                "install",
+                "--git",
+                DEFAULT_UPDATE_REPO,
+                "--branch",
+                "main",
+                "--bins",
+                "--locked",
+                "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_install_args_preserve_detected_install_root() {
+        assert_eq!(
+            cargo_install_args(
+                DEFAULT_UPDATE_REPO,
+                &UpdateRef::Tag("v0.1.0".to_owned()),
+                Some(Path::new("/Users/example/.cargo")),
+            ),
+            vec![
+                "install",
+                "--git",
+                DEFAULT_UPDATE_REPO,
+                "--tag",
+                "v0.1.0",
+                "--root",
+                "/Users/example/.cargo",
+                "--bins",
+                "--locked",
+                "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn install_root_from_exe_path_uses_parent_of_bin_dir() {
+        assert_eq!(
+            install_root_from_exe_path(Path::new("/Users/example/.cargo/bin/ccrx")),
+            Some(PathBuf::from("/Users/example/.cargo"))
+        );
+    }
+
+    #[test]
+    fn install_root_from_exe_path_ignores_non_bin_paths() {
+        assert_eq!(
+            install_root_from_exe_path(Path::new("/repo/target/debug/ccrx")),
+            None
+        );
     }
 }
