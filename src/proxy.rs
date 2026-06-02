@@ -321,8 +321,18 @@ async fn forward(
         }
 
         let attempt_started = Instant::now();
+        let mut pending_attempt_log = PendingUpstreamAttemptLog::new(
+            state.config.raw_log.clone(),
+            local_id.clone(),
+            target,
+            attempt_number,
+            body_len,
+            redacted_url.clone(),
+            request_id_summary.clone(),
+        );
         let upstream = match request.send().await {
             Ok(response) => {
+                pending_attempt_log.complete();
                 let elapsed = attempt_started.elapsed();
                 debug!(
                     local_id,
@@ -336,6 +346,7 @@ async fn forward(
                 response
             }
             Err(error) => {
+                pending_attempt_log.complete();
                 let elapsed = attempt_started.elapsed();
                 warn!(
                     local_id,
@@ -558,6 +569,79 @@ async fn forward(
         attempt = attempt.saturating_add(1);
         tokio::time::sleep(wait.delay).await;
         total_wait = total_wait_after;
+    }
+}
+
+struct PendingUpstreamAttemptLog {
+    raw_log: crate::config::RawLogConfig,
+    local_id: String,
+    target: Target,
+    attempt: u32,
+    body_len: usize,
+    upstream_url: String,
+    upstream_request_id: String,
+    started: Instant,
+    completed: bool,
+}
+
+impl PendingUpstreamAttemptLog {
+    fn new(
+        raw_log: crate::config::RawLogConfig,
+        local_id: String,
+        target: Target,
+        attempt: u32,
+        body_len: usize,
+        upstream_url: String,
+        upstream_request_id: String,
+    ) -> Self {
+        Self {
+            raw_log,
+            local_id,
+            target,
+            attempt,
+            body_len,
+            upstream_url,
+            upstream_request_id,
+            started: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for PendingUpstreamAttemptLog {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        let elapsed = self.started.elapsed();
+        warn!(
+            local_id = %self.local_id,
+            target = self.target.as_str(),
+            attempt = self.attempt,
+            upstream_url = %self.upstream_url,
+            body_len = self.body_len,
+            elapsed_ms = elapsed.as_millis(),
+            upstream_request_id = %self.upstream_request_id,
+            "upstream attempt cancelled before response"
+        );
+        write_raw_event(
+            &self.raw_log,
+            "upstream_attempt_cancelled",
+            json!({
+                "local_id": &self.local_id,
+                "target": self.target.as_str(),
+                "attempt": self.attempt,
+                "upstream_url": &self.upstream_url,
+                "body_len": self.body_len,
+                "elapsed_ms": elapsed.as_millis(),
+                "upstream_request_id": &self.upstream_request_id,
+            }),
+        );
     }
 }
 

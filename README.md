@@ -213,8 +213,9 @@ Tip: use `local_id` in each event to correlate request lifecycle entries (`inbou
 1. Run `ccrx status` and note the printed log path.
 2. Inspect the latest entries for the local correlation ID attached to the stuck request.
 3. If you see `upstream rate-limited request`, check `wait_source`, `wait_ms`, `total_wait_after_ms`, and `budget_ms`; default `RATE_LIMIT_MAX_TOTAL_WAIT_MS=0` means the adapter can wait indefinitely for Copilot's rate-limit window.
-4. If you see `upstream response ready; streaming to client` but no stream terminal event yet, the upstream stream is still active or the downstream client has not fully consumed/dropped it.
-5. If the normal log is not enough, enable raw diagnostics temporarily, reproduce the issue, collect the JSONL, then disable raw diagnostics again.
+4. If you see `upstream attempt cancelled before response`, Codex closed/cancelled the local request while the adapter was still waiting for Copilot response headers.
+5. If you see `upstream response ready; streaming to client` but no stream terminal event yet, the upstream stream is still active or the downstream client has not fully consumed/dropped it.
+6. If the normal log is not enough, enable raw diagnostics temporarily, reproduce the issue, collect the JSONL, then disable raw diagnostics again.
 
 ## Codex config
 
