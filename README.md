@@ -4,6 +4,48 @@
 
 It runs on your machine, listens on `127.0.0.1:60001` by default, handles GitHub Copilot authentication, and forwards Codex Responses API traffic to GitHub Copilot with the provider headers Copilot expects.
 
+## Table of contents
+
+- [Quick start](#quick-start)
+- [What you get](#what-you-get)
+- [Requirements](#requirements)
+- [Install from a local checkout](#install-from-a-local-checkout)
+- [Update installed binaries](#update-installed-binaries)
+- [Sign in to GitHub Copilot](#sign-in-to-github-copilot)
+- [Start the local service](#start-the-local-service)
+- [Configure Codex](#configure-codex)
+- [Optional: command-backed auth](#optional-command-backed-auth)
+- [Configuration reference](#configuration-reference)
+- [Logs and diagnostics](#logs-and-diagnostics)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+
+## Quick start
+
+Install the current released version directly from GitHub, then sign in and start the local service:
+
+```sh
+cargo install --git https://github.com/dpearson2699/codex-code-router --tag v0.1.0 --bins --locked
+ccrx login
+ccrx start
+```
+
+Add this provider block to `~/.codex/config.toml`:
+
+```toml
+[model_providers.copilot-proxy]
+name = "GitHub Copilot Proxy"
+base_url = "http://127.0.0.1:60001/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000
+```
+
+Then select the `copilot-proxy` provider in Codex and choose whichever Copilot model you want to use. The initial install command pins the current release tag for repeatability; after this version is installed, future updates can be run from any folder with `ccrx update`.
+
 ## What you get
 
 - A local OpenAI-compatible Responses endpoint for Codex: `http://127.0.0.1:60001/v1`.
@@ -23,26 +65,14 @@ LiteLLM is useful when you want a general provider gateway, but that flexibility
 
 - A GitHub account with access to GitHub Copilot.
 - Codex CLI installed and working locally.
-- Rust and Cargo installed for building from source.
+- Rust, Cargo, and Git installed. Cargo builds the binaries locally from the GitHub release tag.
 
-## Quick start
+## Install from a local checkout
 
-```sh
-git clone <repo-url> codex-code-router
-cd codex-code-router
-cargo install --path . --bins --locked
-ccrx login
-ccrx start
-```
-
-Then add the `copilot-proxy` provider to `~/.codex/config.toml` as shown below. In Codex, select the `copilot-proxy` model provider and choose whichever Copilot model you want to use. The proxy forwards the model Codex requests; it does not require one fixed model.
-
-## Install from source
-
-Clone the repository and install both binaries with Cargo:
+For development, clone the repository and install both binaries from your local checkout:
 
 ```sh
-git clone <repo-url> codex-code-router
+git clone https://github.com/dpearson2699/codex-code-router.git codex-code-router
 cd codex-code-router
 cargo install --path . --bins --locked
 ```
@@ -60,7 +90,7 @@ If you do not want to install the binaries globally, you can run from the checko
 cargo run --release -- serve
 ```
 
-## Update from source
+## Update installed binaries
 
 After you have a version with the update command installed, the normal update flow is:
 

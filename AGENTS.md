@@ -84,6 +84,7 @@ Before changing code, read the public project guidance:
   - `cargo test`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo build --release`
+- Before tagging a new release, update the README quick-start install command to pin the new release tag.
 - To publish a release that `ccrx update` can discover:
   - `git tag vX.Y.Z`
   - `git push origin vX.Y.Z`
