@@ -8,7 +8,7 @@ target/
 copilot-tokens.json
 *.copilot-tokens.json
 .codex-code-router/
-.private-docs/
+.private-docs
 .serena/
 .DS_Store
 coverage/
