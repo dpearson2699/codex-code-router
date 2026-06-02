@@ -51,7 +51,7 @@ One-time local install from this repo:
 
 ```sh
 cargo build --release --bins
-ln -sf /Users/dpearson/repos/codex-code-router/target/release/ccrx /opt/homebrew/bin/ccrx
+ln -sf "$PWD/target/release/ccrx" /opt/homebrew/bin/ccrx
 ```
 
 If you do not want to install the short command, this also works from the repo:
@@ -261,7 +261,7 @@ stream_max_retries = 5
 stream_idle_timeout_ms = 300000
 
 [model_providers.copilot-proxy.auth]
-command = "/Users/dpearson/repos/codex-code-router/target/release/codex-code-router"
+command = "/path/to/codex-code-router/target/release/codex-code-router"
 args = ["print-token"]
 refresh_interval_ms = 240000
 
@@ -334,4 +334,4 @@ The test suite covers header/URL/JSON redaction, safe config/auth summaries, tok
 
 ## LiteLLM status
 
-LiteLLM was investigated earlier as a possible replacement. It is no longer the recommended or current implementation path for this repo because the project decision is to keep a minimal custom Rust byte-forwarding adapter. The historical note remains in `docs/litellm-copilot-responses-plan.md`; the runnable LiteLLM config was removed.
+LiteLLM was investigated earlier as a possible replacement. It is no longer the recommended or current implementation path for this repo because the project decision is to keep a minimal custom Rust byte-forwarding adapter. The earlier LiteLLM investigation is historical only; the runnable LiteLLM config was removed.

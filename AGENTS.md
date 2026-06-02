@@ -6,15 +6,12 @@ The repository is now the **custom Rust Codex CLI → GitHub Copilot Responses A
 
 ## Read first
 
-Before changing code, read:
+Before changing code, read the public project guidance:
 
 1. `AGENTS.md` — core doctrine and safety rules.
-2. `docs/fresh-session-brief.md` — current repo state and first-session checklist.
-3. `docs/rust-implementation-plan.md` — current Rust implementation notes and future constraints.
-4. `docs/codex-cli-copilot-port-feasibility.md` — feasibility analysis transferred from `.claude-code-router`.
-5. `docs/rate-limit-retry-policy.md` — status/header-based retry behavior for upstream HTTP 429s.
+2. `README.md` — usage, configuration, validation, and public-facing behavior.
 
-`docs/litellm-copilot-responses-plan.md` is historical only. Do not treat LiteLLM as the recommended path unless a future explicit product decision reverses this one.
+Do not treat LiteLLM as the recommended path unless a future explicit product decision reverses this one.
 
 ## Core doctrine
 
@@ -48,7 +45,7 @@ Before changing code, read:
 - The adapter can refresh expired Copilot token-file values from a saved `githubToken` and can create that token file through interactive GitHub OAuth device login.
 - For refreshable token-file auth, the adapter can force-refresh once after upstream HTTP `401` and replay the original request bytes.
 - If service-owned auth is unavailable, the adapter can forward an incoming Codex `Authorization` header.
-- The adapter retries upstream HTTP `429` rate limits before sending downstream bytes, following `docs/rate-limit-retry-policy.md`.
+- The adapter retries upstream HTTP `429` rate limits before sending downstream bytes, based on HTTP status and rate-limit headers only.
 - The adapter passes Responses SSE back unchanged.
 
 ## Implementation direction
@@ -60,7 +57,7 @@ Before changing code, read:
 
 ## Fresh-session onboarding
 
-- Read `AGENTS.md` and `docs/fresh-session-brief.md` at the start of a new assistant session.
+- Read `AGENTS.md` and `README.md` at the start of a new assistant session.
 - Run the Rust validation commands before and after behavioral changes when possible.
 - If the user asks about LiteLLM, state that it is a historical investigation and not the current path unless they explicitly ask to revisit that decision.
 
