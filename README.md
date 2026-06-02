@@ -115,7 +115,7 @@ ccrx update --tag v0.1.0
 If you want a repeatable first install pinned to a specific crates.io version, use Cargo's package-version form:
 
 ```sh
-cargo install codex-code-router@0.1.1
+cargo install codex-code-router@1.0.0
 ```
 
 To install without restarting immediately:

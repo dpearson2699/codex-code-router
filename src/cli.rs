@@ -441,13 +441,13 @@ mod tests {
             cargo_install_args(
                 &UpdateRef::CratesIo {
                     crate_name: DEFAULT_UPDATE_CRATE.to_owned(),
-                    version: Some("0.1.1".to_owned()),
+                    version: Some("1.0.0".to_owned()),
                 },
                 None,
             ),
             vec![
                 "install",
-                "codex-code-router@0.1.1",
+                "codex-code-router@1.0.0",
                 "--bins",
                 "--locked",
                 "--force",
