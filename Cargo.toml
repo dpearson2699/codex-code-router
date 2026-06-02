@@ -2,7 +2,7 @@
 name = "codex-code-router"
 version = "0.1.0"
 edition = "2021"
-license = "UNLICENSED"
+license = "MIT"
 description = "Minimal Codex CLI adapter for GitHub Copilot's Responses API endpoint."
 
 [dependencies]
