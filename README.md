@@ -1,24 +1,41 @@
 # codex-code-router
 
-`codex-code-router` is a small local service that lets Codex CLI use GitHub Copilot as a Responses API provider.
+`codex-code-router` is a small local service that lets Codex use GitHub Copilot as a Responses API provider.
 
 It runs on your machine, listens on `127.0.0.1:60001` by default, handles GitHub Copilot authentication, and forwards Codex Responses API traffic to GitHub Copilot with the provider headers Copilot expects.
 
 ## Table of contents
 
-- [Quick start](#quick-start)
 - [What you get](#what-you-get)
 - [Requirements](#requirements)
+- [Quick start](#quick-start)
 - [Install from a local checkout](#install-from-a-local-checkout)
 - [Update installed binaries](#update-installed-binaries)
 - [Sign in to GitHub Copilot](#sign-in-to-github-copilot)
-- [Start the local service](#start-the-local-service)
+- [Run the local service](#run-the-local-service)
 - [Configure Codex](#configure-codex)
-- [Optional: command-backed auth](#optional-command-backed-auth)
+- [Authentication](#authentication)
 - [Configuration reference](#configuration-reference)
 - [Logs and diagnostics](#logs-and-diagnostics)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+
+## What you get
+
+- A local OpenAI-compatible Responses endpoint for Codex: `http://127.0.0.1:60001/v1`.
+- GitHub Copilot device login from the command line.
+- Automatic refresh for saved Copilot tokens.
+- Background service commands for starting, stopping, restarting, and checking status.
+- Safe metadata logs for troubleshooting, without printing bearer tokens or request bodies.
+- HTTP `429` rate-limit retries based on provider status and headers.
+
+The adapter is intentionally narrow: it supports Codex-style Responses API traffic only. It does not provide a Chat Completions endpoint, Docker workflow, or broad multi-provider routing. Compared with a general gateway like LiteLLM, it skips protocol normalization and request/response transformation: Codex already speaks the Responses API shape this project needs, so the adapter just handles Copilot auth, headers, endpoint mapping, token refresh, and HTTP `429` retries while leaving Codex request bodies and Responses SSE streams as unchanged as possible.
+
+## Requirements
+
+- A GitHub account with access to GitHub Copilot.
+- Codex installed locally, either the Codex CLI or the Codex desktop app. You do not need to be signed in to Codex first; this provider supplies its own Copilot auth.
+- Rust and Cargo installed. Cargo builds the binaries locally from crates.io.
 
 ## Quick start
 
@@ -44,28 +61,7 @@ stream_max_retries = 5
 stream_idle_timeout_ms = 300000
 ```
 
-Then select the `copilot-proxy` provider in Codex and choose whichever Copilot model you want to use. Future updates can be run from any folder with `ccrx update`.
-
-## What you get
-
-- A local OpenAI-compatible Responses endpoint for Codex: `http://127.0.0.1:60001/v1`.
-- GitHub Copilot device login from the command line.
-- Automatic refresh for saved Copilot tokens.
-- Background service commands for starting, stopping, restarting, and checking status.
-- Safe metadata logs for troubleshooting, without printing bearer tokens or request bodies.
-- HTTP `429` rate-limit retries based on provider status and headers.
-
-The adapter is intentionally narrow: it supports Codex-style Responses API traffic only. It does not provide a Chat Completions endpoint, Docker workflow, or broad multi-provider routing.
-
-## Why use this instead of LiteLLM?
-
-LiteLLM is useful when you want a general provider gateway, but that flexibility usually comes with protocol normalization and request/response transformation. Codex already speaks the Responses API shape this project needs, so `codex-code-router` keeps the path thinner: it handles Copilot auth, headers, endpoint mapping, token refresh, and HTTP `429` retries while leaving Codex request bodies and Responses SSE streams as unchanged as possible.
-
-## Requirements
-
-- A GitHub account with access to GitHub Copilot.
-- Codex CLI installed and working locally.
-- Rust and Cargo installed. Cargo builds the binaries locally from crates.io.
+Then select the `copilot-proxy` provider in Codex and choose whichever Copilot model you want to use. Future updates can be run from any folder with `ccrx update`. See [Configure Codex](#configure-codex) for defaults, profiles, and per-setting explanations.
 
 ## Install from a local checkout
 
@@ -124,7 +120,7 @@ To install without restarting immediately:
 ccrx update --no-restart
 ```
 
-If your installed `ccrx` is too old to have the `update` command, bootstrap once from your cloned checkout:
+If your installed `ccrx` is too old to have the `update` command, bootstrap once from your cloned checkout (use `ccrx start` if the service is not already running):
 
 ```sh
 cd /path/to/codex-code-router
@@ -134,11 +130,7 @@ ccrx restart
 ccrx status
 ```
 
-That keeps your existing Codex config and saved Copilot token file. It only updates the installed `ccrx` and `codex-code-router` binaries, then restarts the background service so Codex uses the new code. Future updates can use `ccrx update` from any folder.
-
-If the service was not already running, use `ccrx start` instead of `ccrx restart`.
-
-If `git pull --ff-only` reports local changes in your checkout, stop and review them before updating. Either commit them, stash them, or use `ccrx update` so Cargo installs from crates.io without touching your local files.
+This updates only the installed binaries and restarts the service; your Codex config and saved token file are untouched, and `ccrx update` works from any folder afterward. If `git pull --ff-only` reports local changes, review them first or use `ccrx update` instead, which installs from crates.io without touching your checkout.
 
 ## Sign in to GitHub Copilot
 
@@ -158,7 +150,7 @@ Token values are not printed. On Unix-like systems, the saved token file is writ
 
 You can also skip `ccrx login` and let `ccrx start` prompt you the first time authentication is needed.
 
-## Start the local service
+## Run the local service
 
 Start the adapter in the background:
 
@@ -196,21 +188,7 @@ codex-code-router
 
 ## Configure Codex
 
-Add a Copilot-backed provider to your Codex config, usually `~/.codex/config.toml`:
-
-```toml
-[model_providers.copilot-proxy]
-name = "GitHub Copilot Proxy"
-base_url = "http://127.0.0.1:60001/v1"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-request_max_retries = 4
-stream_max_retries = 5
-stream_idle_timeout_ms = 300000
-```
-
-That provider block is the required Codex-side setup. After it exists, you can switch to `copilot-proxy` in Codex's model/provider controls and choose the model there.
+The provider block shown in [Quick start](#quick-start) is the required Codex-side setup, added to your Codex config (usually `~/.codex/config.toml`). Every setting is explained in the [Codex provider settings](#codex-provider-settings) table. After the block exists, you can switch to `copilot-proxy` in Codex's model/provider controls and choose the model there.
 
 If you want this provider to be your default in Codex, set the top-level defaults in the same `~/.codex/config.toml`:
 
@@ -235,19 +213,23 @@ Then run Codex with that profile when desired:
 codex --profile copilot
 ```
 
-You do not need a separate `copilot.config.toml` file for the local provider to work. A separate profile file may be useful for some personal workflows, but it is optional and can pin a model if you put a `model = ...` value in it.
+You do not need a separate `copilot.config.toml` file; the profile block above is optional and only pins a model if you set `model = ...` in it.
 
-For day-to-day use, start the adapter and use Codex normally:
-
-```sh
-ccrx start
-```
-
-## Optional: command-backed auth
+## Authentication
 
 The recommended setup is service-owned auth: `ccrx start` reads and refreshes `~/.copilot-tokens.json`, and Codex only talks to the local endpoint.
 
-If you prefer Codex to attach the Copilot bearer token to local requests, configure command-backed auth with an absolute path to the installed binary:
+The service chooses upstream Copilot auth in this order:
+
+1. `COPILOT_BEARER_TOKEN`
+2. `COPILOT_TOKEN_FILE`, defaulting to `~/.copilot-tokens.json`
+3. An incoming `Authorization` header from Codex, if neither service-owned source is available
+
+The token file contains a GitHub token plus a Copilot token. When the Copilot token is expired or near expiry, the service refreshes it from the saved GitHub token and rewrites the same file without printing secrets. If GitHub Copilot returns upstream HTTP `401 Unauthorized` for an otherwise locally-valid token-file token, the service force-refreshes the token file once and replays the original request body bytes. That reactive refresh is only used for token-file auth.
+
+### Command-backed auth (optional)
+
+If you prefer Codex to attach the Copilot bearer token to local requests instead of letting the service own auth, configure command-backed auth with an absolute path to the installed binary:
 
 ```toml
 [model_providers.copilot-proxy.auth]
@@ -257,18 +239,6 @@ refresh_interval_ms = 240000
 ```
 
 For `print-token`, stdout contains only the bearer token. Diagnostics go to stderr.
-
-## Authentication details
-
-The service chooses upstream Copilot auth in this order:
-
-1. `COPILOT_BEARER_TOKEN`
-2. `COPILOT_TOKEN_FILE`, defaulting to `~/.copilot-tokens.json`
-3. An incoming `Authorization` header from Codex, if neither service-owned source is available
-
-The token file contains a GitHub token plus a Copilot token. When the Copilot token is expired or near expiry, the service refreshes it from the saved GitHub token and rewrites the same file without printing secrets.
-
-If GitHub Copilot returns upstream HTTP `401 Unauthorized` for an otherwise locally-valid token-file token, the service force-refreshes the token file once and replays the original request body bytes. That reactive refresh is only used for token-file auth.
 
 ## Configuration reference
 
