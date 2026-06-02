@@ -22,10 +22,10 @@ It runs on your machine, listens on `127.0.0.1:60001` by default, handles GitHub
 
 ## Quick start
 
-Install the current released version directly from GitHub, then sign in and start the local service:
+Install directly from GitHub, then sign in and start the local service:
 
 ```sh
-cargo install --git https://github.com/dpearson2699/codex-code-router --tag v0.1.0 --bins --locked
+cargo install --git https://github.com/dpearson2699/codex-code-router
 ccrx login
 ccrx start
 ```
@@ -44,7 +44,7 @@ stream_max_retries = 5
 stream_idle_timeout_ms = 300000
 ```
 
-Then select the `copilot-proxy` provider in Codex and choose whichever Copilot model you want to use. The initial install command pins the current release tag for repeatability; after this version is installed, future updates can be run from any folder with `ccrx update`.
+Then select the `copilot-proxy` provider in Codex and choose whichever Copilot model you want to use. Future updates can be run from any folder with `ccrx update`.
 
 ## What you get
 
@@ -65,7 +65,7 @@ LiteLLM is useful when you want a general provider gateway, but that flexibility
 
 - A GitHub account with access to GitHub Copilot.
 - Codex CLI installed and working locally.
-- Rust, Cargo, and Git installed. Cargo builds the binaries locally from the GitHub release tag.
+- Rust, Cargo, and Git installed. Cargo builds the binaries locally from GitHub.
 
 ## Install from a local checkout
 
@@ -110,6 +110,12 @@ To install a specific tag:
 
 ```sh
 ccrx update --tag v0.1.0
+```
+
+If you want a repeatable first install pinned to a specific release tag, use Cargo's explicit tag form:
+
+```sh
+cargo install --git https://github.com/dpearson2699/codex-code-router --tag v0.1.0 --bins --locked
 ```
 
 To install without restarting immediately:
