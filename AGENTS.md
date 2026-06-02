@@ -77,6 +77,7 @@ Before changing code, read the public project guidance:
 - The default `ccrx update` path discovers the latest GitHub Release for `dpearson2699/codex-code-router`, then runs `cargo install --git ... --tag <tag> --bins --locked --force` locally.
 - `ccrx update` is intended to run from any current working directory; it should not depend on a local checkout.
 - When possible, `ccrx update` infers the existing Cargo install root from the running binary path (`.../bin/ccrx`) and passes `--root <root>` to `cargo install` so updated binaries land beside the existing install.
+- Keep install locations conceptually separate: the source checkout can live anywhere, Cargo owns the binary install root (usually `~/.cargo/bin`), and `~/.codex-code-router` is runtime state only (`pid`, logs, raw diagnostics), not the binary install directory.
 - GitHub Release artifacts are optional. A source tag plus GitHub Release is enough because users build locally with Cargo.
 - Before creating a release, run the Rust validation commands:
   - `cargo fmt --check`

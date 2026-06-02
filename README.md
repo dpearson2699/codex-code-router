@@ -52,6 +52,8 @@ This installs:
 - `ccrx` — the short service-control command you will normally use.
 - `codex-code-router` — the full binary, useful for foreground runs and command-backed auth.
 
+The source checkout can live anywhere, such as `~/repos/codex-code-router`, and is not used by the background service after installation. Cargo installs the runnable binaries into its install `bin` directory, usually `~/.cargo/bin` unless your environment uses a different Cargo install root. The `~/.codex-code-router` directory is only runtime state for the background service, such as the PID file and logs; it is not intended to be the binary install location.
+
 If you do not want to install the binaries globally, you can run from the checkout instead:
 
 ```sh
