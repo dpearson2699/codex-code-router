@@ -1,10 +1,12 @@
 [package]
 name = "codex-code-router"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Minimal Codex CLI adapter for GitHub Copilot's Responses API endpoint."
 repository = "https://github.com/dpearson2699/codex-code-router"
+keywords = ["codex", "copilot", "proxy", "responses"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"

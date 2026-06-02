@@ -62,7 +62,7 @@ Before changing code, read the public project guidance:
 - Restart local service after install: `ccrx restart`
 - Stop local service after install: `ccrx stop`
 - Check local service after install: `ccrx status`
-- Update installed binaries from GitHub: `ccrx update`
+- Update installed binaries from crates.io: `ccrx update`
 - Run interactive GitHub Copilot device login: `ccrx login`
 - Run local service without installing the short command: `cargo run --release -- serve`
 - Print token helper output: `cargo run --quiet -- print-token`
@@ -73,23 +73,27 @@ Before changing code, read the public project guidance:
 
 ## Release flow for `ccrx update`
 
-- Do not publish this project to npm, crates.io, Homebrew, or another package registry unless the user explicitly asks.
-- The default `ccrx update` path discovers the latest GitHub Release for `dpearson2699/codex-code-router`, then runs `cargo install --git ... --tag <tag> --bins --locked --force` locally.
+- Do not publish this project to npm, Homebrew, or another package registry unless the user explicitly asks. Publishing to crates.io is allowed when the user explicitly requests it.
+- The public install path is `cargo install codex-code-router` from crates.io.
+- The default `ccrx update` path reinstalls the latest `codex-code-router` package from crates.io, then restarts the service.
 - `ccrx update` is intended to run from any current working directory; it should not depend on a local checkout.
 - When possible, `ccrx update` infers the existing Cargo install root from the running binary path (`.../bin/ccrx`) and passes `--root <root>` to `cargo install` so updated binaries land beside the existing install.
 - Keep install locations conceptually separate: the source checkout can live anywhere, Cargo owns the binary install root (usually `~/.cargo/bin`), and `~/.codex-code-router` is runtime state only (`pid`, logs, raw diagnostics), not the binary install directory.
-- GitHub Release artifacts are optional. A source tag plus GitHub Release is enough because users build locally with Cargo.
+- Keep GitHub tag/branch update paths available for testing and fallback: `ccrx update --tag vX.Y.Z`, `ccrx update --branch main`, and `ccrx update --repo <url>`.
+- GitHub Release artifacts are optional. A source tag plus GitHub Release is enough for GitHub-source updates because users build locally with Cargo.
 - Before creating a release, run the Rust validation commands:
   - `cargo fmt --check`
   - `cargo test`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo build --release`
-- Keep the README quick-start install command simple: `cargo install --git https://github.com/dpearson2699/codex-code-router`. Do not make the primary path require `--tag`, `--bins`, or `--locked`; keep pinned release installs as an optional reproducibility note.
+- Run `cargo publish --dry-run` before publishing to crates.io.
+- Publish to crates.io with `cargo publish` only after validation and dry-run pass.
+- Keep the README quick-start install command simple: `cargo install codex-code-router`. Do not make the primary path require a version, `--git`, `--tag`, `--bins`, or `--locked`; keep pinned installs as an optional reproducibility note.
 - To publish a release that `ccrx update` can discover:
   - `git tag vX.Y.Z`
   - `git push origin vX.Y.Z`
   - `gh release create vX.Y.Z --generate-notes`
-- If only a Git tag exists and no GitHub Release exists, users can still update with `ccrx update --tag vX.Y.Z`, but plain `ccrx update` requires a GitHub Release.
+- If only a Git tag exists and no GitHub Release exists, users can still update with `ccrx update --tag vX.Y.Z`. Plain `ccrx update` uses crates.io.
 - For unreleased testing from the default branch, use `ccrx update --branch main`.
 
 ## Coding conventions

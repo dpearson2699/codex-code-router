@@ -22,10 +22,10 @@ It runs on your machine, listens on `127.0.0.1:60001` by default, handles GitHub
 
 ## Quick start
 
-Install directly from GitHub, then sign in and start the local service:
+Install from crates.io, then sign in and start the local service:
 
 ```sh
-cargo install --git https://github.com/dpearson2699/codex-code-router
+cargo install codex-code-router
 ccrx login
 ccrx start
 ```
@@ -65,7 +65,7 @@ LiteLLM is useful when you want a general provider gateway, but that flexibility
 
 - A GitHub account with access to GitHub Copilot.
 - Codex CLI installed and working locally.
-- Rust, Cargo, and Git installed. Cargo builds the binaries locally from GitHub.
+- Rust and Cargo installed. Cargo builds the binaries locally from crates.io.
 
 ## Install from a local checkout
 
@@ -98,24 +98,24 @@ After you have a version with the update command installed, the normal update fl
 ccrx update
 ```
 
-You can run that from any directory. It does not require a local checkout. By default, `ccrx update` looks up the latest GitHub Release for this repository, reinstalls both binaries from that release tag with Cargo, and restarts the background service. When possible, it infers the existing Cargo install root from the running `ccrx` binary, so the updated binaries land in the same install location. This does not require npm, crates.io, Homebrew, or prebuilt release artifacts; it builds from the Git tag locally.
+You can run that from any directory. It does not require a local checkout. By default, `ccrx update` reinstalls the latest `codex-code-router` package from crates.io and restarts the background service. When possible, it infers the existing Cargo install root from the running `ccrx` binary, so the updated binaries land in the same install location.
 
-To update from the latest `main` branch instead of the latest GitHub Release:
+To test an unreleased build from the latest GitHub `main` branch:
 
 ```sh
 ccrx update --branch main
 ```
 
-To install a specific tag:
+To install from a specific GitHub tag:
 
 ```sh
 ccrx update --tag v0.1.0
 ```
 
-If you want a repeatable first install pinned to a specific release tag, use Cargo's explicit tag form:
+If you want a repeatable first install pinned to a specific crates.io version, use Cargo's package-version form:
 
 ```sh
-cargo install --git https://github.com/dpearson2699/codex-code-router --tag v0.1.0 --bins --locked
+cargo install codex-code-router@0.1.1
 ```
 
 To install without restarting immediately:
@@ -138,7 +138,7 @@ That keeps your existing Codex config and saved Copilot token file. It only upda
 
 If the service was not already running, use `ccrx start` instead of `ccrx restart`.
 
-If `git pull --ff-only` reports local changes in your checkout, stop and review them before updating. Either commit them, stash them, or use `ccrx update --branch main` so Cargo installs from GitHub without touching your local files.
+If `git pull --ff-only` reports local changes in your checkout, stop and review them before updating. Either commit them, stash them, or use `ccrx update` so Cargo installs from crates.io without touching your local files.
 
 ## Sign in to GitHub Copilot
 

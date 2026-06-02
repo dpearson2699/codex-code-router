@@ -17,6 +17,7 @@ use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LOG_FILTER: &str = "codex_code_router=info,warn";
+const DEFAULT_UPDATE_CRATE: &str = "codex-code-router";
 const DEFAULT_UPDATE_REPO: &str = "https://github.com/dpearson2699/codex-code-router";
 const UPDATE_USER_AGENT: &str = concat!("codex-code-router/", env!("CARGO_PKG_VERSION"));
 
@@ -39,7 +40,7 @@ enum Command {
     Restart,
     /// Show whether the local adapter service is reachable.
     Status,
-    /// Update installed binaries from GitHub and restart the service.
+    /// Update installed binaries from crates.io and restart the service.
     Update(UpdateArgs),
     /// Run interactive GitHub Copilot device login and save the token file.
     Login,
@@ -49,14 +50,20 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct UpdateArgs {
-    /// Git repository to install from.
-    #[arg(long, default_value = DEFAULT_UPDATE_REPO)]
-    repo: String,
+    /// Crates.io package to install from.
+    #[arg(long = "crate", default_value = DEFAULT_UPDATE_CRATE)]
+    crate_name: String,
+    /// Install a specific crates.io package version instead of the latest version.
+    #[arg(long, conflicts_with_all = ["repo", "tag", "branch"])]
+    version: Option<String>,
+    /// Git repository to install from instead of crates.io.
+    #[arg(long)]
+    repo: Option<String>,
     /// Install a specific Git tag instead of the latest GitHub release.
-    #[arg(long, conflicts_with = "branch")]
+    #[arg(long, conflicts_with_all = ["branch", "version"])]
     tag: Option<String>,
     /// Install a branch instead of the latest GitHub release.
-    #[arg(long, conflicts_with = "tag")]
+    #[arg(long, conflicts_with_all = ["tag", "version"])]
     branch: Option<String>,
     /// Install binaries without restarting the background service.
     #[arg(long)]
@@ -65,11 +72,39 @@ struct UpdateArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UpdateRef {
+    CratesIo {
+        crate_name: String,
+        version: Option<String>,
+    },
+    Git {
+        repo: String,
+        git_ref: GitUpdateRef,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GitUpdateRef {
     Tag(String),
     Branch(String),
 }
 
 impl UpdateRef {
+    fn description(&self) -> String {
+        match self {
+            Self::CratesIo {
+                crate_name,
+                version: Some(version),
+            } => format!("crates.io package {crate_name}@{version}"),
+            Self::CratesIo {
+                crate_name,
+                version: None,
+            } => format!("latest crates.io package {crate_name}"),
+            Self::Git { repo, git_ref } => format!("{} from {repo}", git_ref.description()),
+        }
+    }
+}
+
+impl GitUpdateRef {
     fn description(&self) -> String {
         match self {
             Self::Tag(tag) => format!("tag {tag}"),
@@ -107,12 +142,8 @@ pub async fn run() -> anyhow::Result<()> {
 
 async fn update(args: UpdateArgs) -> anyhow::Result<()> {
     let update_ref = resolve_update_ref(&args).await?;
-    println!(
-        "updating ccrx from {} ({})",
-        args.repo,
-        update_ref.description()
-    );
-    cargo_install_from_git(&args.repo, &update_ref)?;
+    println!("updating ccrx from {}", update_ref.description());
+    cargo_install_update(&update_ref)?;
     println!("installed updated ccrx binaries");
 
     if args.no_restart {
@@ -126,13 +157,22 @@ async fn update(args: UpdateArgs) -> anyhow::Result<()> {
 }
 
 async fn resolve_update_ref(args: &UpdateArgs) -> Result<UpdateRef> {
+    let repo = args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty());
+
     if let Some(tag) = args
         .tag
         .as_deref()
         .map(str::trim)
         .filter(|tag| !tag.is_empty())
     {
-        return Ok(UpdateRef::Tag(tag.to_owned()));
+        return Ok(UpdateRef::Git {
+            repo: repo.unwrap_or(DEFAULT_UPDATE_REPO).to_owned(),
+            git_ref: GitUpdateRef::Tag(tag.to_owned()),
+        });
     }
     if let Some(branch) = args
         .branch
@@ -140,12 +180,30 @@ async fn resolve_update_ref(args: &UpdateArgs) -> Result<UpdateRef> {
         .map(str::trim)
         .filter(|branch| !branch.is_empty())
     {
-        return Ok(UpdateRef::Branch(branch.to_owned()));
+        return Ok(UpdateRef::Git {
+            repo: repo.unwrap_or(DEFAULT_UPDATE_REPO).to_owned(),
+            git_ref: GitUpdateRef::Branch(branch.to_owned()),
+        });
     }
 
-    fetch_latest_release_tag(&args.repo)
-        .await
-        .map(UpdateRef::Tag)
+    if let Some(repo) = repo {
+        return fetch_latest_release_tag(repo)
+            .await
+            .map(|tag| UpdateRef::Git {
+                repo: repo.to_owned(),
+                git_ref: GitUpdateRef::Tag(tag),
+            });
+    }
+
+    Ok(UpdateRef::CratesIo {
+        crate_name: args.crate_name.trim().to_owned(),
+        version: args
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .map(ToOwned::to_owned),
+    })
 }
 
 async fn fetch_latest_release_tag(repo: &str) -> Result<String> {
@@ -207,7 +265,7 @@ fn github_latest_release_api_url(repo: &str) -> Result<String> {
     ))
 }
 
-fn cargo_install_from_git(repo: &str, update_ref: &UpdateRef) -> Result<()> {
+fn cargo_install_update(update_ref: &UpdateRef) -> Result<()> {
     let install_root = current_install_root();
     if let Some(root) = &install_root {
         println!("install root: {}", root.display());
@@ -215,7 +273,7 @@ fn cargo_install_from_git(repo: &str, update_ref: &UpdateRef) -> Result<()> {
         println!("install root: cargo default");
     }
 
-    let args = cargo_install_args(repo, update_ref, install_root.as_deref());
+    let args = cargo_install_args(update_ref, install_root.as_deref());
     println!("running: cargo {}", args.join(" "));
 
     let status = ProcessCommand::new("cargo")
@@ -248,15 +306,26 @@ fn install_root_from_exe_path(exe: &Path) -> Option<PathBuf> {
     bin_dir.parent().map(Path::to_path_buf)
 }
 
-fn cargo_install_args(
-    repo: &str,
-    update_ref: &UpdateRef,
-    install_root: Option<&Path>,
-) -> Vec<String> {
-    let mut args = vec!["install".to_owned(), "--git".to_owned(), repo.to_owned()];
+fn cargo_install_args(update_ref: &UpdateRef, install_root: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["install".to_owned()];
     match update_ref {
-        UpdateRef::Tag(tag) => args.extend(["--tag".to_owned(), tag.to_owned()]),
-        UpdateRef::Branch(branch) => args.extend(["--branch".to_owned(), branch.to_owned()]),
+        UpdateRef::CratesIo {
+            crate_name,
+            version: Some(version),
+        } => args.push(format!("{crate_name}@{version}")),
+        UpdateRef::CratesIo {
+            crate_name,
+            version: None,
+        } => args.push(crate_name.to_owned()),
+        UpdateRef::Git { repo, git_ref } => {
+            args.extend(["--git".to_owned(), repo.to_owned()]);
+            match git_ref {
+                GitUpdateRef::Tag(tag) => args.extend(["--tag".to_owned(), tag.to_owned()]),
+                GitUpdateRef::Branch(branch) => {
+                    args.extend(["--branch".to_owned(), branch.to_owned()])
+                }
+            }
+        }
     }
     if let Some(root) = install_root {
         args.extend(["--root".to_owned(), root.display().to_string()]);
@@ -347,11 +416,53 @@ mod tests {
     }
 
     #[test]
-    fn cargo_install_args_use_release_tag() {
+    fn cargo_install_args_use_crates_io_by_default() {
         assert_eq!(
             cargo_install_args(
-                DEFAULT_UPDATE_REPO,
-                &UpdateRef::Tag("v0.1.0".to_owned()),
+                &UpdateRef::CratesIo {
+                    crate_name: DEFAULT_UPDATE_CRATE.to_owned(),
+                    version: None,
+                },
+                None,
+            ),
+            vec![
+                "install",
+                DEFAULT_UPDATE_CRATE,
+                "--bins",
+                "--locked",
+                "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_install_args_can_pin_crates_io_version() {
+        assert_eq!(
+            cargo_install_args(
+                &UpdateRef::CratesIo {
+                    crate_name: DEFAULT_UPDATE_CRATE.to_owned(),
+                    version: Some("0.1.1".to_owned()),
+                },
+                None,
+            ),
+            vec![
+                "install",
+                "codex-code-router@0.1.1",
+                "--bins",
+                "--locked",
+                "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_install_args_can_use_git_release_tag() {
+        assert_eq!(
+            cargo_install_args(
+                &UpdateRef::Git {
+                    repo: DEFAULT_UPDATE_REPO.to_owned(),
+                    git_ref: GitUpdateRef::Tag("v0.1.0".to_owned()),
+                },
                 None,
             ),
             vec![
@@ -368,11 +479,13 @@ mod tests {
     }
 
     #[test]
-    fn cargo_install_args_can_use_branch() {
+    fn cargo_install_args_can_use_git_branch() {
         assert_eq!(
             cargo_install_args(
-                DEFAULT_UPDATE_REPO,
-                &UpdateRef::Branch("main".to_owned()),
+                &UpdateRef::Git {
+                    repo: DEFAULT_UPDATE_REPO.to_owned(),
+                    git_ref: GitUpdateRef::Branch("main".to_owned()),
+                },
                 None,
             ),
             vec![
@@ -392,16 +505,15 @@ mod tests {
     fn cargo_install_args_preserve_detected_install_root() {
         assert_eq!(
             cargo_install_args(
-                DEFAULT_UPDATE_REPO,
-                &UpdateRef::Tag("v0.1.0".to_owned()),
+                &UpdateRef::CratesIo {
+                    crate_name: DEFAULT_UPDATE_CRATE.to_owned(),
+                    version: None,
+                },
                 Some(Path::new("/Users/example/.cargo")),
             ),
             vec![
                 "install",
-                "--git",
-                DEFAULT_UPDATE_REPO,
-                "--tag",
-                "v0.1.0",
+                DEFAULT_UPDATE_CRATE,
                 "--root",
                 "/Users/example/.cargo",
                 "--bins",
