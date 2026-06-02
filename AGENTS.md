@@ -2,16 +2,12 @@
 
 This repo is a small, deliberately thin Rust adapter for using Codex CLI with GitHub Copilot's Responses API endpoint.
 
-The repository is now the **custom Rust Codex CLI → GitHub Copilot Responses API adapter**. LiteLLM is not the current implementation path, and Node/TypeScript is no longer the runtime path.
-
 ## Read first
 
 Before changing code, read the public project guidance:
 
 1. `AGENTS.md` — core doctrine and safety rules.
 2. `README.md` — usage, configuration, validation, and public-facing behavior.
-
-Do not treat LiteLLM as the recommended path unless a future explicit product decision reverses this one.
 
 ## Core doctrine
 
@@ -25,7 +21,7 @@ Do not treat LiteLLM as the recommended path unless a future explicit product de
 
 ## Hard constraints
 
-- Do **not** recreate CCR's transformer architecture.
+- Do **not** recreate a transformer architecture.
 - Do **not** add Chat Completions, Anthropic Messages, or Anthropic SSE bridges.
 - Do **not** rewrite, truncate, summarize, or reshape tool calls by default.
 - Do **not** parse request bodies unless a specific, tested Copilot compatibility fix requires it.
@@ -52,14 +48,13 @@ Do not treat LiteLLM as the recommended path unless a future explicit product de
 
 - Rust is canonical.
 - Preserve the external contract: `GET /health`, `GET /v1/models`, `POST /v1/responses`.
-- Preserve the minimal-adapter doctrine; do not port TypeScript or CCR behavior for its own sake.
+- Preserve the minimal-adapter doctrine; do not add generic protocol translation behavior for its own sake.
 - If a body compatibility pass becomes necessary, isolate it behind tests and document exactly why.
 
 ## Fresh-session onboarding
 
 - Read `AGENTS.md` and `README.md` at the start of a new assistant session.
 - Run the Rust validation commands before and after behavioral changes when possible.
-- If the user asks about LiteLLM, state that it is a historical investigation and not the current path unless they explicitly ask to revisit that decision.
 
 ## Commands
 
